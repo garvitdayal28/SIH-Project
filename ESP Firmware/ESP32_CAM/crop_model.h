@@ -21,7 +21,14 @@
 // ("arena used: N bytes") and this can be trimmed to that plus ~10%.
 //
 // It is allocated in PSRAM, so being generous costs nothing on a 4 MB module.
-#define CROP_ARENA_BYTES (600 * 1024)
+// Measured on this board: "[CV] Arena used: 159548 bytes". 176 KB gives that
+// about 10% headroom.
+//
+// The size matters for more than memory. At 600 KB the arena could only ever
+// live in PSRAM; at this size it fits in internal SRAM, which is several times
+// faster for the scattered reads and writes inference does. cropModelInit()
+// tries internal first and falls back to PSRAM, and says which it got.
+#define CROP_ARENA_BYTES (176 * 1024)
 
 // esp32-camera's JPEG decoder writes its output in B,G,R order rather than
 // R,G,B -- a consequence of that converter being shared with the BMP writer,
@@ -29,7 +36,7 @@
 //
 // Getting this wrong does not fail loudly. It silently swaps red and blue,
 // which is close to worst case for this particular model: config.py notes that
-// onion, potato and ginger are separated mainly BY their brown/tan colour.
+// a yellow lemon and a red tomato are separated mainly BY their colour.
 //
 // Leave at 1 unless the mean-RGB check in the README says otherwise.
 #define CROP_SWAP_RB 1

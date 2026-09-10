@@ -57,17 +57,44 @@ static const char *AP_PASSWORD = "farmfrost";   // min 8 chars, or "" for open
 // the AP was started on -- so this one setting drives both.
 #define WIFI_CHANNEL         1
 
-// --- Fan ------------------------------------------------------------------
-// D5 on the NodeMCU silkscreen. Chosen because it has no role at boot, unlike
-// D3/D4/D8. This pin drives the GATE of a MOSFET, never the fan directly --
-// see section 7 of the spec.
-#define FAN_PWM_PIN          D5
+// --- Fan: L298N H-bridge --------------------------------------------------
+// The motor is driven through an L298N, so three pins instead of one: ENA
+// carries the PWM that sets the speed, IN1/IN2 set the direction. The spec's
+// rule from section 7 still holds and is satisfied -- the GPIO drives the
+// driver's logic input, never the motor itself.
+//
+//   NodeMCU          L298N
+//   D5 (GPIO14) ---> ENA      speed (PWM). Remove the ENA jumper!
+//   D6 (GPIO12) ---> IN1      direction
+//   D7 (GPIO13) ---> IN2      direction
+//   GND         ---> GND      must be common with the motor supply
+//
+// D5/D6/D7 are chosen because none of them has a role at boot. D3, D4 and D8
+// are pulled or sampled by the bootloader and a driver board tied to them can
+// stop the NodeMCU from starting at all.
+#define FAN_ENA_PIN          D5
+#define FAN_IN1_PIN          D6
+#define FAN_IN2_PIN          D7
 
 // The ESP8266 generates PWM in software, so high frequencies cost CPU time.
 // 1 kHz is inaudible enough through a fan and leaves the radio alone. If the
 // fan whines, 20000 is usually the fix, at some cost in timing jitter.
 #define PWM_FREQ_HZ          1000
 #define PWM_RANGE            255
+
+// A motor that is stopped needs far more duty to break away than it needs to
+// keep turning, and the L298N eats roughly 1.4-2 V of the supply on top of
+// that. Without help, the lower entries in FAN_SPEED (ginger at 40%, onion at
+// 35%) tend to sit there buzzing instead of turning.
+//
+// So: when starting from rest, drive 100% for KICKSTART_MS, then drop to the
+// target. Only from rest -- changing between two non-zero speeds does not need
+// it, and kicking every time would be audible.
+#define KICKSTART_ENABLED    1
+#define KICKSTART_MS         250
+// Below this the motor is treated as stopped rather than driven at a duty it
+// would only hum at. Raise it if your motor still buzzes without turning.
+#define FAN_MIN_DUTY_PCT     20
 
 // --- Reliability ----------------------------------------------------------
 // Below this confidence the detection is ignored and the fan holds its
@@ -91,36 +118,44 @@ static const char *AP_PASSWORD = "farmfrost";   // min 8 chars, or "" for open
 // ==========================================================================
 // Crop table
 //
-// Index order comes from class_names() in "Crop detection model/config.py":
-// crops alphabetically, then unknown last. The index IS the crop_id on the
-// wire, so this must stay in step with the model and with the camera sketch.
+// Index order comes from class_names() in "Crop detection model/config.py",
+// which is plain alphabetical INCLUDING `empty`. The index IS the crop_id on
+// the wire, so this must stay in step with the model and the camera sketch.
+//
+// `empty` is not last any more. It used to be, when the class was called
+// `unknown` and was appended after the crops, and this table encoded that with
+// CROP_COUNT - 1. Left alone across the class change, that expression pointed
+// at TOMATO -- so a tomato would have been discarded as "no crop" while every
+// other id ran the fan profile of whatever crop used to sit at that index.
+// The index is named explicitly now rather than computed.
 // ==========================================================================
 
 static const char *CROP_NAMES[] = {
-  "APPLE", "BANANA", "CORN", "GINGER",
-  "LEMON", "ONION", "POTATO", "TOMATO", "UNKNOWN"
+  "BANANA", "EMPTY", "LEMON", "ONION", "TOMATO"
 };
 
 // Fan speed per crop, in percent.
 //
-// PLACEHOLDER VALUES. Tomato/Potato/Onion/Banana are the examples given in
-// section 6 of the spec; the rest are filler in the same spirit. Replace all
-// of them with the real FarmFrost storage requirements before this means
-// anything. UNKNOWN's entry is never used while UNKNOWN_KEEPS_PREVIOUS is 1.
+// PLACEHOLDER VALUES. Tomato, Onion and Banana are the examples given in
+// section 6 of the spec; Lemon is filler in the same spirit. Replace all of
+// them with the real FarmFrost storage requirements before this means
+// anything. EMPTY's entry is never used while UNKNOWN_KEEPS_PREVIOUS is 1.
 static const uint8_t FAN_SPEED[] = {
-   55,   // APPLE    placeholder
    60,   // BANANA   from spec
-   50,   // CORN     placeholder
-   40,   // GINGER   placeholder
+    0,   // EMPTY    unused, see UNKNOWN_KEEPS_PREVIOUS
    60,   // LEMON    placeholder
    35,   // ONION    from spec
-   45,   // POTATO   from spec
-   70,   // TOMATO   from spec
-    0    // UNKNOWN  unused, see UNKNOWN_KEEPS_PREVIOUS
+   70    // TOMATO   from spec
 };
 
 static const uint8_t CROP_COUNT   = sizeof(CROP_NAMES) / sizeof(CROP_NAMES[0]);
-static const uint8_t CROP_UNKNOWN = CROP_COUNT - 1;
+
+// The id meaning "no crop present". Stated, not derived: it is index 1, not
+// the last entry, and a computed CROP_COUNT - 1 silently became TOMATO when
+// the class list changed.
+static const uint8_t CROP_UNKNOWN = 1;   // EMPTY
+
+static_assert(CROP_UNKNOWN < CROP_COUNT, "CROP_UNKNOWN out of range");
 
 static_assert(sizeof(FAN_SPEED) / sizeof(FAN_SPEED[0]) == CROP_COUNT,
               "FAN_SPEED must have one entry per crop");
@@ -165,14 +200,40 @@ ESP8266WebServer server(80);
 
 static void setFanSpeed(uint8_t percent) {
   if (percent > 100) percent = 100;
+
+  const bool wasStopped = (g_fanSpeed == 0);
   g_fanSpeed = percent;
 
-  // Most 12 V fans will not start from rest below roughly 30% duty, though
-  // they keep spinning well below that once going. If a real fan stalls at the
-  // lower table values, the fix is a brief 100% kick here before settling to
-  // the target -- deliberately left out of V1 until a real fan proves it needs
-  // it, since it needs the fan's actual stall duty to be tuned properly.
-  analogWrite(FAN_PWM_PIN, (percent * PWM_RANGE) / 100);
+  // Anything at or below the stall duty is off outright. Driving a motor at a
+  // duty it can only hum at wastes current and cooks the driver for nothing.
+  if (percent == 0 || percent < FAN_MIN_DUTY_PCT) {
+    if (percent > 0) {
+      Serial.printf("[MAIN] %u%% is below the %u%% stall floor, motor off\n",
+                    percent, FAN_MIN_DUTY_PCT);
+    }
+    analogWrite(FAN_ENA_PIN, 0);
+    digitalWrite(FAN_IN1_PIN, LOW);    // both low = coast
+    digitalWrite(FAN_IN2_PIN, LOW);
+    g_fanSpeed = 0;
+    Serial.println("[MAIN] PWM updated: 0%");
+    return;
+  }
+
+  // Direction. One way only -- a fan has no reason to reverse, and IN1/IN2
+  // must never both be HIGH.
+  digitalWrite(FAN_IN1_PIN, HIGH);
+  digitalWrite(FAN_IN2_PIN, LOW);
+
+#if KICKSTART_ENABLED
+  if (wasStopped && percent < 100) {
+    analogWrite(FAN_ENA_PIN, PWM_RANGE);
+    Serial.printf("[MAIN] Kickstart 100%% for %u ms\n", KICKSTART_MS);
+    delay(KICKSTART_MS);               // safe here: called from loop(), never
+                                       // from the ESP-NOW receive callback
+  }
+#endif
+
+  analogWrite(FAN_ENA_PIN, (percent * PWM_RANGE) / 100);
 
   Serial.printf("[MAIN] PWM updated: %u%%\n", percent);
 }
@@ -350,7 +411,13 @@ void setup() {
   Serial.println();
   Serial.println("[MAIN] FarmFrost main controller starting");
 
-  pinMode(FAN_PWM_PIN, OUTPUT);
+  pinMode(FAN_ENA_PIN, OUTPUT);
+  pinMode(FAN_IN1_PIN, OUTPUT);
+  pinMode(FAN_IN2_PIN, OUTPUT);
+  // Park the H-bridge before PWM is configured, so the motor cannot twitch
+  // while the pins settle.
+  digitalWrite(FAN_IN1_PIN, LOW);
+  digitalWrite(FAN_IN2_PIN, LOW);
   analogWriteRange(PWM_RANGE);
   analogWriteFreq(PWM_FREQ_HZ);
   setFanSpeed(FAN_SPEED_DEFAULT);

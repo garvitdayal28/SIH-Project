@@ -48,7 +48,7 @@ holds these four, and wrong the moment it does not.
    | Setting | Value | Why |
    |---|---|---|
    | Board | AI Thinker ESP32-CAM | |
-   | PSRAM | **Enabled** | The 600 KB tensor arena lives there |
+   | PSRAM | **Enabled** | The camera frame buffer needs it, and the arena falls back to it |
    | Partition Scheme | **Huge APP (3MB No OTA/1MB SPIFFS)** | The model alone is ~968 KB |
    | Upload Speed | 921600 (drop to 115200 if it fails) | |
 
@@ -185,8 +185,9 @@ Global variables use 90344 bytes (27%) of dynamic memory, leaving 237336 bytes
 for local variables. Maximum is 327680 bytes.
 ```
 
-66% of flash with the model in it, and 27% of internal RAM before the arena —
-which is the whole reason the arena goes in PSRAM instead.
+66% of flash with the model in it, and 27% of internal RAM before the arena.
+Whether the remaining internal SRAM can hold the 176 KB arena decides how fast
+inference runs — see the boot log below, which says which memory it got.
 
 You will also see this, twice, and it is harmless:
 
@@ -207,8 +208,9 @@ Serial Monitor at **115200 baud**:
 [CAM] FarmFrost ESP32-CAM starting
 [CAM] PSRAM: found
 [CAM] Camera ready
-[CV] Model loaded: 989400 bytes of weights
-[CV] Arena used: 233472 of 614400 bytes
+[CV] Arena: 180224 bytes in internal SRAM (fast)
+[CV] Model loaded: 989304 bytes of weights
+[CV] Arena used: 159548 of 180224 bytes
 [CV] Input  int8 96x96x3, scale 1.000000 zp -128
 [CV] Output int8 5 classes, scale 0.003906 zp -128
 [CAM] Desktop viewer ready
@@ -226,8 +228,15 @@ Then every 5 s:
 ```
 
 Once it is running, **`Arena used:` tells you what to set `CROP_ARENA_BYTES` to**
-in `crop_model.h` — that figure plus ~10%. The 600 KB default is deliberately
-generous because `AllocateTensors()` failing is a hard stop.
+in `crop_model.h` — that figure plus ~10%. It is 176 KB, measured rather than
+guessed, and the size is not only about memory: at 600 KB the arena could only
+ever live in PSRAM, while at this size it may fit internal SRAM, which is
+several times faster for the scattered access inference does. `cropModelInit()`
+tries internal first, falls back to PSRAM, and prints which it got.
+
+If `AllocateTensors` fails, raising this is the *second* thing to try. See
+Troubleshooting first — a per-channel-quantized classifier head produces the
+same error message and is not a memory problem at all.
 
 ## 6. Seeing it on the desktop
 
@@ -265,8 +274,9 @@ the numbers measured on the desktop (72/72 on real rig photographs) carry over.
 If they disagree, something in the imaging chain differs and it is worth finding
 before blaming the model.
 
-**Leave `ENABLE_ESPNOW 0` for this.** You want the serial log and the web page,
-not a radio.
+ESP-NOW is on by default now and does no harm here — if the NodeMCU is not
+powered the sends simply fail and say so. Set `ENABLE_ESPNOW 0` if you want the
+log quiet.
 
 1. Put one item in the box, close it as you would for a real reading, and watch
    the serial monitor at 115200:
@@ -336,15 +346,33 @@ then re-flash. **Banana especially**: it currently has no real photographs at
 all and is trained entirely on Kaggle bananas composited into the box, so it is
 the class most likely to disappoint on the real camera.
 
-## 8. Turning on ESP-NOW
+## 8. ESP-NOW
 
-Off by default because it needs the main board's MAC address.
+**On by default**, with a real NodeMCU SoftAP MAC already filled in
+(`8E:AA:B5:4F:E4:66`). If you are using a different NodeMCU you must change
+`MAIN_ESP_MAC` — the sketch prints a loud boot warning if it is ever left at the
+old `AA:BB:CC:...` placeholder, but it cannot tell that a real-looking address
+belongs to somebody else's board.
 
 1. Flash `../Main_ESP8266/Main_ESP8266.ino` and read its serial output. It
    prints two MACs and labels them — use the **SoftAP MAC**.
 2. Paste it into `MAIN_ESP_MAC` in this sketch.
-3. Set `#define ENABLE_ESPNOW 1`.
-4. `WIFI_CHANNEL` must be the same number in both sketches (1 by default).
+3. `WIFI_CHANNEL` must be the same number in both sketches (1 by default).
+
+Two failure modes worth knowing, both previously silent and both now fixed:
+
+- **`peer.ifidx`.** Zero-initialising `esp_now_peer_info_t` leaves it at
+  `WIFI_IF_STA`, but with the viewer on the board runs `WiFi.mode(WIFI_AP)` and
+  the station interface never starts. Every send failed with
+  `ESP_ERR_ESPNOW_IF` while classification looked perfect. The sketch now sets
+  `WIFI_IF_AP` when the viewer is enabled.
+- **`esp_now_send()`'s return value** was discarded. That is the local call
+  failing outright — wrong interface, peer not added — and is distinct from the
+  send *callback*, which only reports whether the frame was acknowledged. Both
+  are logged now.
+
+An `empty` reading is never transmitted: it is a correct answer with no crop to
+act on, so the fan holds whatever the last real crop set.
 
 The SoftAP-vs-station MAC distinction matters: the NodeMCU is in access-point
 mode so the phone can join it, and ESP-NOW must be addressed to the AP-side
@@ -380,9 +408,13 @@ If it needs to be faster:
 | `undefined reference to g_crop_model_data` | `model_data` is still `.cc`. Rename to `.cpp` — section 3. |
 | `text section exceeds available space` | Partition Scheme is not Huge APP. |
 | `[CV] No PSRAM` | PSRAM disabled under Tools, or a module without it. |
-| `[CV] AllocateTensors failed` | Raise `CROP_ARENA_BYTES` in `crop_model.h`. |
+| `FullyConnected per-channel quantization not yet supported`, then `AllocateTensors failed` | **Not a memory problem**, despite the message. The classifier head was exported per-channel and TFLM only implements per-tensor for it. Re-export: `export_tflite.py` sets `_experimental_disable_per_channel_quantization_for_dense_layers`. |
+| `[CV] AllocateTensors failed`, no other message | Raise `CROP_ARENA_BYTES` in `crop_model.h`. |
+| `[CV] Arena: ... in PSRAM -- expect much slower inference` | Not an error. Internal SRAM was full; inference still works, just slower. |
 | `[CV] Model schema N, library expects M` | Library and export are different TFLM generations. Re-export, or change library version. |
 | Every crop reads as one class, high confidence | Almost always the R/B swap — section 6. |
+| Viewer picture never updates while serial shows captures | Fixed: the cache-buster was keyed to the *detection* counter, which never advances when inference fails. It uses the capture counter now. |
+| Classification works, fan never moves | ESP-NOW addressed to the wrong interface or the wrong MAC — section 8. |
 | Confidence always low | Lighting, or the object is not filling the centre square. The viewer shows the full frame; the model only sees the centre crop. |
 | `Camera init failed: 0x105` | Ribbon cable not seated, or 3.3 V power. Reseat, use 5 V. |
 | Board reboots in a loop | Brownout. Needs a supply that can do ~500 mA at 5 V. |

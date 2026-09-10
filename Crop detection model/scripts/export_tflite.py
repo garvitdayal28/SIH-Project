@@ -144,6 +144,23 @@ def main() -> None:
     converter.inference_input_type = tf.int8
     converter.inference_output_type = tf.int8
 
+    # The converter quantizes Dense/FullyConnected weights per-channel by
+    # default. TFLite Micro's fully_connected kernel only implements per-tensor
+    # for the filter -- fully_connected_common.cpp asserts scale->size == 1 --
+    # so a per-channel head makes AllocateTensors() fail on the board with:
+    #
+    #   FullyConnected per-channel quantization not yet supported.
+    #   Node FULLY_CONNECTED (number 30f) failed to prepare with status 1
+    #   [CV] AllocateTensors failed -- raise CROP_ARENA_BYTES
+    #
+    # That last line is a red herring; the arena is fine. Conv2D and
+    # DepthwiseConv2D keep per-channel either way -- TFLM supports those -- so
+    # this only affects the classifier head, where the per-channel scales span
+    # a narrow range and collapsing them costs no measurable accuracy.
+    #
+    # Found by Yash on the yash branch, against a model that would not boot.
+    converter._experimental_disable_per_channel_quantization_for_dense_layers = True
+
     print("Converting...")
     tflite_bytes = converter.convert()
 

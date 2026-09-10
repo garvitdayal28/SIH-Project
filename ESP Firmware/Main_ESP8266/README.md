@@ -40,25 +40,49 @@ No extra libraries. Everything used ships with the core.
 **The GPIO must never drive the fan directly** (spec §7). GPIO gives 3.3 V at a
 few mA; a fan wants its own supply at amps.
 
+This build drives the motor through an **L298N** H-bridge.
+
 ```
-              +12V (fan supply)
-                │
-              [FAN]
-                │
-   D5 ──[220Ω]──┤ GATE
-                │
-             MOSFET (logic-level N-channel, e.g. IRLZ44N)
-                │
-               GND ─── shared with NodeMCU GND
+   NodeMCU                 L298N                    Motor / supply
+
+   D5 (GPIO14) ──────────► ENA   (speed, PWM)
+   D6 (GPIO12) ──────────► IN1   (direction)
+   D7 (GPIO13) ──────────► IN2   (direction)
+   GND ─────────────────── GND ──────────────────── supply GND
+                           OUT1 ─────────────────── motor +
+                           OUT2 ─────────────────── motor -
+                           +12V ◄────────────────── motor supply +
+                           +5V  ── (see note below)
 ```
 
-- Use a **logic-level** MOSFET. A plain IRF540 will not fully turn on from
-  3.3 V and will cook itself.
-- Put a **flyback diode** across the fan if it is a brushed DC motor.
-- The fan supply ground and the NodeMCU ground **must be connected**, or the
-  gate has no reference and the fan will behave erratically.
-- Test with an LED + resistor on D5 first. It should visibly dim across the
-  speed steps before a real fan goes anywhere near the board.
+- **Remove the ENA jumper.** L298N boards ship with a jumper tying ENA to +5 V,
+  which pins the motor at full speed and ignores your PWM entirely. The single
+  most common reason "the fan only runs flat out".
+- **Do not feed the NodeMCU from the L298N's 5 V pin** unless you are sure the
+  board has its onboard regulator enabled (the 5V-EN jumper) *and* the motor
+  supply is 12 V or less. Powering the NodeMCU from USB while the motor runs
+  off its own supply is the safe arrangement.
+- **Grounds must be common** — NodeMCU GND to L298N GND to supply GND. Without
+  it the direction inputs have no reference and the motor behaves erratically.
+- The L298N drops roughly **1.4–2 V** across its output stage, so a 12 V supply
+  gives the motor about 10 V. Size the supply accordingly.
+- IN1/IN2 must **never both be HIGH**. The firmware only ever sets IN1 HIGH and
+  IN2 LOW, so this is handled — but check it if you rewire.
+- Test with an **LED + resistor on ENA** first, before a motor goes anywhere
+  near it. It should visibly dim across the speed steps.
+
+### Stall floor and kickstart
+
+A stopped motor needs much more duty to break away than to keep turning. Two
+settings in the sketch handle that:
+
+| Setting | Default | Does |
+|---|---|---|
+| `FAN_MIN_DUTY_PCT` | 20 | Below this the motor is switched off rather than left buzzing |
+| `KICKSTART_MS` | 250 | Drives 100% briefly when starting from rest, then drops to target |
+
+If your motor still hums without turning at the lower crop speeds (onion is
+35%, ginger 40%), raise `FAN_MIN_DUTY_PCT` or lengthen `KICKSTART_MS`.
 
 ## 3. Bring-up order
 
@@ -127,7 +151,7 @@ All of spec §15, and what it does:
 |---|---|
 | `crop_id` outside the table | Fan unchanged, counted in `ignored` |
 | Confidence < 60% | Fan unchanged, counted in `ignored` |
-| `UNKNOWN` at high confidence | Fan unchanged (`UNKNOWN_KEEPS_PREVIOUS 1`) |
+| `EMPTY` at high confidence | Fan unchanged (`UNKNOWN_KEEPS_PREVIOUS 1`). The camera does not transmit these at all, so it should not arrive; the check stays as a backstop. |
 | Camera silent > 15 s | `cam_online: false`, **fan keeps running** |
 | Packet lost | Gap logged, last valid state retained |
 | Phone disconnects | No effect whatsoever on fan control |
