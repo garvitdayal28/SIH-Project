@@ -412,10 +412,12 @@ If it needs to be faster:
 | `[CV] AllocateTensors failed`, no other message | Raise `CROP_ARENA_BYTES` in `crop_model.h`. |
 | `[CV] Arena: ... in PSRAM -- expect much slower inference` | Not an error. Internal SRAM was full; inference still works, just slower. |
 | `[CV] Model schema N, library expects M` | Library and export are different TFLM generations. Re-export, or change library version. |
+| One crop consistently reads as another, others fine | The R/B swap. Read `subject RGB` in the detection log: on a tomato R must lead. This is what made tomato read as lemon every time; `CROP_SWAP_RB` is now `0`. |
 | Every crop reads as one class, high confidence | Almost always the R/B swap — section 6. |
 | Viewer picture never updates while serial shows captures | Fixed: the cache-buster was keyed to the *detection* counter, which never advances when inference fails. It uses the capture counter now. |
 | Classification works, fan never moves | ESP-NOW addressed to the wrong interface or the wrong MAC — section 8. |
 | Confidence always low | Lighting, or the object is not filling the centre square. The viewer shows the full frame; the model only sees the centre crop. |
+| `infer` around 19000 ms | The arena landed in PSRAM. Check the `[CV] Arena:` line at boot. Still works, just slow — see section 9. |
 | `Camera init failed: 0x105` | Ribbon cable not seated, or 3.3 V power. Reseat, use 5 V. |
 | Board reboots in a loop | Brownout. Needs a supply that can do ~500 mA at 5 V. |
 | `Failed to connect... Timed out waiting for packet header` | GPIO0 not grounded, or RESET not pressed before upload. |

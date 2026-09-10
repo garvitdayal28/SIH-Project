@@ -38,8 +38,29 @@
 // which is close to worst case for this particular model: config.py notes that
 // a yellow lemon and a red tomato are separated mainly BY their colour.
 //
-// Leave at 1 unless the mean-RGB check in the README says otherwise.
-#define CROP_SWAP_RB 1
+// Set to 0 on 2026-09-11, from evidence on the real board. It had been 1.
+//
+// Symptom: tomato read as lemon essentially every time, while lemon, onion and
+// empty were all correct. Two independent things point at the same cause.
+//
+//   The serial log's frame mean had red as the LOWEST channel and blue the
+//   highest on frames containing a red tomato -- 136,142,144 and 126,131,132
+//   and 130,129,134. That is backwards for a red subject.
+//
+//   Replaying the real rig photographs through the model with R and B
+//   exchanged, at the tighter framing this camera gives, reproduces the
+//   symptom and nothing else does: tomato 9/23 with lemon as the largest
+//   failure bucket, while lemon stays 23/24 and onion 24/25. With the channels
+//   correct, all three are perfect.
+//
+// So this driver build already hands back R,G,B and the swap was corrupting it.
+// The BGR quirk described above is real but evidently version-dependent, which
+// is why this is a switch and not an assumption.
+//
+// Confirm on the board with the "subject RGB" figure in the detection log --
+// see cropModelLastSubjectRGB(). On a tomato R should now lead by a wide
+// margin. If instead B leads, put this back to 1.
+#define CROP_SWAP_RB 0
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,6 +99,24 @@ uint32_t cropModelLastInferMs(void);
 // red: r should come back well above b. If they are reversed, flip
 // CROP_SWAP_RB. There is no other symptom -- the model just quietly gets worse.
 void cropModelLastMeanRGB(uint8_t *r, uint8_t *g, uint8_t *b);
+
+// Mean colour of the ITEM, not the whole frame -- the average of the tenth of
+// pixels with the most chroma, plus that chroma value.
+//
+// This is the number to read when a class is being confused with another. The
+// whole-frame mean cannot answer it: the box is a big white surface, so a red
+// tomato shifts the frame mean by a couple of units, less than the sensor's
+// own colour cast. The subject mean shifts by a hundred.
+//
+// Expected, roughly:  tomato  R much greater than G and B, chroma > 40
+//                     lemon   R and G high, B lower, chroma > 40
+//                     onion   all low, chroma modest
+//                     empty   near-neutral, chroma < 15
+//
+// If a tomato reports B above R, CROP_SWAP_RB is set the wrong way.
+// If chroma is under ~15 on a coloured item, the frame is desaturated and the
+// colour the model relies on is simply not there.
+void cropModelLastSubjectRGB(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *chroma);
 
 // Peak arena usage reported by the interpreter after allocation, for tuning
 // CROP_ARENA_BYTES.

@@ -76,6 +76,10 @@ uint32_t g_prepMs  = 0;
 uint32_t g_inferMs = 0;
 uint8_t  g_meanR = 0, g_meanG = 0, g_meanB = 0;
 
+// Colour of the item itself, as opposed to the whole frame. See measureSubject().
+uint8_t  g_subjR = 0, g_subjG = 0, g_subjB = 0, g_subjChroma = 0;
+void measureSubject(const uint8_t *tensor);
+
 // Input quantization, read from the model rather than hardcoded, so a
 // re-export with different parameters cannot silently corrupt the input.
 float g_inScaleInv = 1.0f;
@@ -170,6 +174,55 @@ void resizeSquareToInput(const uint8_t *src, int srcStride,
   g_meanR = (uint8_t)(sumR / pixels);
   g_meanG = (uint8_t)(sumG / pixels);
   g_meanB = (uint8_t)(sumB / pixels);
+
+  measureSubject(dst);
+}
+
+// Mean colour of the most colourful pixels in the tensor, i.e. the item.
+//
+// The whole-frame mean is close to useless for diagnosing colour here, and
+// that cost real debugging time: the box is a large white surface and the item
+// is a small part of the frame, so a red tomato moved the frame mean by about
+// two units per channel -- less than the sensor's own cast. The frame mean can
+// tell you the picture is dark. It cannot tell you the item is red.
+//
+// So: take the pixels whose chroma (max channel - min channel) is in the top
+// tenth, and average those. On an empty box nothing is colourful and the
+// result is neutral, which is itself the correct answer.
+void measureSubject(const uint8_t *tensor) {
+  const uint32_t pixels = (uint32_t)kInputSize * kInputSize;
+
+  // Chroma histogram, so the threshold needs no sorting or second buffer.
+  uint16_t hist[256] = {0};
+  for (uint32_t i = 0; i < pixels; i++) {
+    const uint8_t *p = tensor + i * 3;
+    uint8_t hi = p[0] > p[1] ? p[0] : p[1]; if (p[2] > hi) hi = p[2];
+    uint8_t lo = p[0] < p[1] ? p[0] : p[1]; if (p[2] < lo) lo = p[2];
+    hist[hi - lo]++;
+  }
+
+  const uint32_t want = pixels / 10;
+  uint32_t seen = 0;
+  int threshold = 255;
+  for (int c = 255; c >= 0; c--) {
+    seen += hist[c];
+    if (seen >= want) { threshold = c; break; }
+  }
+
+  uint32_t sr = 0, sg = 0, sb = 0, n = 0, sc = 0;
+  for (uint32_t i = 0; i < pixels; i++) {
+    const uint8_t *p = tensor + i * 3;
+    uint8_t hi = p[0] > p[1] ? p[0] : p[1]; if (p[2] > hi) hi = p[2];
+    uint8_t lo = p[0] < p[1] ? p[0] : p[1]; if (p[2] < lo) lo = p[2];
+    if ((int)(hi - lo) >= threshold) {
+      sr += p[0]; sg += p[1]; sb += p[2]; sc += (hi - lo); n++;
+    }
+  }
+  if (n == 0) n = 1;
+  g_subjR = (uint8_t)(sr / n);
+  g_subjG = (uint8_t)(sg / n);
+  g_subjB = (uint8_t)(sb / n);
+  g_subjChroma = (uint8_t)(sc / n);
 }
 
 }  // namespace
@@ -349,6 +402,13 @@ bool cropModelClassify(const uint8_t *jpeg, size_t len,
   *cropId     = (uint8_t)best;
   *confidence = (uint8_t)lroundf(p * 100.0f);
   return true;
+}
+
+void cropModelLastSubjectRGB(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *chroma) {
+  if (r) *r = g_subjR;
+  if (g) *g = g_subjG;
+  if (b) *b = g_subjB;
+  if (chroma) *chroma = g_subjChroma;
 }
 
 uint32_t cropModelLastPrepMs(void)  { return g_prepMs; }

@@ -699,12 +699,28 @@ void loop() {
 
   uint8_t mr, mg, mb;
   cropModelLastMeanRGB(&mr, &mg, &mb);
+  uint8_t sr, sg, sb, sc;
+  cropModelLastSubjectRGB(&sr, &sg, &sb, &sc);
 
   Serial.printf("[CAM] Crop: %s\n", CROP_NAMES[g_cropId]);
   Serial.printf("[CAM] Confidence: %u%%\n", g_confidence);
-  Serial.printf("[CAM] prep %lums, infer %lums | mean RGB %u,%u,%u\n",
+  // Two colour readings, and the second is the useful one.
+  //
+  // "frame" is the mean over the whole 96x96 tensor. It is dominated by the
+  // white box, so a red tomato moves it by a couple of units -- less than the
+  // sensor's own cast. It tells you the picture is dark; it cannot tell you
+  // the item is red.
+  //
+  // "subject" is the mean of the tenth of pixels with the most chroma, i.e.
+  // the item. On a tomato R should be far above G and B. If B leads instead,
+  // CROP_SWAP_RB is set the wrong way round. If chroma is under ~15 on a
+  // coloured item, the frame is washed out and the colour the model relies on
+  // is not in the picture at all.
+  Serial.printf("[CAM] prep %lums, infer %lums | frame RGB %u,%u,%u"
+                " | subject RGB %u,%u,%u chroma %u\n",
                 (unsigned long)cropModelLastPrepMs(),
-                (unsigned long)cropModelLastInferMs(), mr, mg, mb);
+                (unsigned long)cropModelLastInferMs(),
+                mr, mg, mb, sr, sg, sb, sc);
 
 #if ENABLE_ESPNOW
   if (g_cropId == CROP_EMPTY) {
