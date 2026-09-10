@@ -14,6 +14,7 @@
 
 #include <Arduino.h>
 #include <math.h>
+#include <esp_heap_caps.h>    // heap_caps_malloc(), to place the arena by hand
 #include "crop_model.h"
 #include "model_data.h"
 #include "img_converters.h"   // fmt2rgb888(), from the esp32-camera driver
@@ -187,7 +188,22 @@ bool cropModelInit(void) {
     return false;
   }
 
-  g_arena = (uint8_t *)ps_malloc(CROP_ARENA_BYTES);
+  // Internal SRAM first. Every intermediate activation is read and written
+  // through this buffer, and PSRAM is reached over a much slower bus, so where
+  // the arena lands dominates inference time -- far more than it looks like it
+  // should. Fall back to PSRAM rather than refusing to run.
+  g_arena = (uint8_t *)heap_caps_malloc(CROP_ARENA_BYTES,
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (g_arena) {
+    Serial.printf("[CV] Arena: %u bytes in internal SRAM (fast)\n",
+                  (unsigned)CROP_ARENA_BYTES);
+  } else {
+    g_arena = (uint8_t *)ps_malloc(CROP_ARENA_BYTES);
+    if (g_arena) {
+      Serial.printf("[CV] Arena: %u bytes in PSRAM -- internal SRAM was full, "
+                    "expect much slower inference\n", (unsigned)CROP_ARENA_BYTES);
+    }
+  }
   if (!g_arena) {
     Serial.printf("[CV] Could not allocate a %u byte arena\n",
                   (unsigned)CROP_ARENA_BYTES);

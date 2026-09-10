@@ -10,6 +10,10 @@
  *   the one that was classified -- not a newer one -- so the picture you see
  *   on the desktop always matches the crop and confidence printed next to it.
  *
+ *   The white LED lights for the capture itself and goes out again before
+ *   inference starts, so every classified frame is lit the same way. Set
+ *   FLASH_ENABLED to 0 if the subject is already well lit.
+ *
  *   The state is exposed three ways:
  *     1. Serial monitor  -- log lines, always on.
  *     2. Desktop browser -- the board runs its own Wi-Fi access point and a
@@ -92,8 +96,16 @@ static const char *AP_PASSWORD = "farmfrost";   // min 8 chars, or "" for open
 // station MAC. Those are two different addresses on the same chip -- sending
 // to the wrong one fails silently, with the send callback reporting success.
 // Main_ESP8266.ino prints both at boot and labels which is which.
-#define ENABLE_ESPNOW       0
-static uint8_t MAIN_ESP_MAC[6] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+#define ENABLE_ESPNOW       1
+
+// The NodeMCU's SoftAP MAC. Taken from the BSSID its "FarmFrost" access point
+// broadcasts, which for an ESP8266 softAP is the same address -- note the 8e
+// against the station side's 8c, the AP-side offset described above.
+//
+// If you swap to a different NodeMCU, this must change. Read the new one from
+// that board's boot log, or scan for its AP:
+//   netsh wlan show networks mode=bssid        (Windows)
+static uint8_t MAIN_ESP_MAC[6] = { 0x8E, 0xAA, 0xB5, 0x4F, 0xE4, 0x66 };
 
 // ESP-NOW and the access point must sit on the same Wi-Fi channel, so this
 // value is used for both. The main board has to listen on it too.
@@ -106,8 +118,19 @@ static uint8_t MAIN_ESP_MAC[6] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
 // and the page will occasionally skip a poll. That is expected on this chip.
 //
 // The real per-frame cost is printed every cycle as "prep Nms, infer Nms".
-// Set this to comfortably more than their sum.
-#define DETECT_INTERVAL_MS  5000
+//
+// This is idle time BETWEEN cycles, and the web server only gets served during
+// it -- loop() is single-threaded, so while inference runs, every request to
+// the page is queued or dropped.
+//
+// 0 therefore does not mean "fastest useful". It means the server never gets a
+// gap at all and the viewer starves: the picture stops updating even though
+// detection is running fine. 1000 ms leaves room for roughly one status poll
+// plus one image fetch per cycle, which is what makes the page look alive.
+//
+// Raise it to be kinder to the flash LED and the 5 V rail; lower it only if
+// you do not care about the viewer.
+#define DETECT_INTERVAL_MS  1000
 
 // Below this the main board keeps its previous fan state. Mirrors
 // CONFIDENCE_THRESHOLD = 0.60 in "Crop detection model/config.py".
@@ -116,6 +139,28 @@ static uint8_t MAIN_ESP_MAC[6] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
 // --- Board pins -----------------------------------------------------------
 #define FLASH_LED_PIN        4    // the bright white LED
 #define STATUS_LED_PIN      33    // the small red LED, active LOW
+
+// --- Flash while classifying ---------------------------------------------
+// The model was trained on well-lit photographs, so a dim frame is not a
+// neutral loss of quality -- it desaturates exactly the brown/tan colour that
+// config.py says separates onion, potato and ginger. Lighting the subject is
+// the cheapest accuracy the board has.
+//
+// The LED is driven with digitalWrite rather than PWM on purpose. Brightness
+// control would mean LEDC, and the camera driver already holds an LEDC timer
+// for the 20 MHz XCLK -- it claims that timer down in the IDF, where the
+// Arduino LEDC allocator cannot see it, so ledcAttach() is free to hand out
+// the same timer and reconfigure it to a few kHz. That kills the pixel clock:
+// the light works and the camera stops. Full brightness for a fraction of a
+// second is the safe trade.
+#define FLASH_ENABLED         1
+// Time for the sensor's auto-exposure to adapt after the light comes on.
+// Grabbing immediately gives a frame still exposed for the dark scene, which
+// comes out blown out and is worse than no flash at all.
+#define FLASH_SETTLE_MS     250
+// The driver fills its buffers continuously, so the frames already queued when
+// the LED lit are pre-flash. Drop them and take the next one.
+#define FLASH_DISCARD_FRAMES  2
 
 // ==========================================================================
 // Crop table
@@ -186,7 +231,13 @@ static uint16_t g_jpegW      = 0;         // its dimensions, needed to decode it
 static uint16_t g_jpegH      = 0;
 static uint8_t  g_cropId     = CROP_UNKNOWN;
 static uint8_t  g_confidence = 0;
-static uint32_t g_seq        = 0;
+static uint32_t g_seq        = 0;         // detections, i.e. successful inferences
+// Captures. Counted separately from g_seq because the page uses this as the
+// cache-buster on the image: keying it to g_seq meant that whenever inference
+// failed -- which is every single frame if the model did not load -- the URL
+// never changed, the browser served the first photo from cache forever, and
+// the viewer looked frozen while the serial log showed captures ticking by.
+static uint32_t g_capSeq     = 0;
 static uint32_t g_lastDetectMs = 0;
 static bool     g_modelOk    = false;     // cropModelInit() succeeded
 
@@ -267,7 +318,25 @@ static bool initCamera() {
 // buffer directly would mean the web page could receive a half-overwritten
 // image. So we copy into PSRAM, then release immediately.
 static bool captureFrame() {
+#if FLASH_ENABLED
+  digitalWrite(FLASH_LED_PIN, HIGH);
+  delay(FLASH_SETTLE_MS);
+  for (int i = 0; i < FLASH_DISCARD_FRAMES; i++) {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (stale) esp_camera_fb_return(stale);
+  }
+#endif
+
   camera_fb_t *fb = esp_camera_fb_get();
+
+#if FLASH_ENABLED
+  // Off the moment the frame is in hand. The LED runs hot and draws hard
+  // enough to matter on a board whose brownout detector is already disabled,
+  // so it stays lit for the capture and nothing else -- in particular not for
+  // the seconds of inference that follow.
+  digitalWrite(FLASH_LED_PIN, LOW);
+#endif
+
   if (!fb) {
     Serial.println("[CAM] Capture failed");
     return false;
@@ -292,6 +361,7 @@ static bool captureFrame() {
   g_jpegLen = copyLen;
   g_jpegW   = copyW;
   g_jpegH   = copyH;
+  g_capSeq++;
   return true;
 }
 
@@ -335,6 +405,16 @@ static void onEspNowSent(const uint8_t *mac, esp_now_send_status_t status) {
 }
 
 static bool initEspNow() {
+  static const uint8_t placeholder[6] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+  if (memcmp(MAIN_ESP_MAC, placeholder, 6) == 0) {
+    Serial.println("[CAM] ***********************************************");
+    Serial.println("[CAM] MAIN_ESP_MAC is still the placeholder.");
+    Serial.println("[CAM] Flash Main_ESP8266.ino, copy the SoftAP MAC it");
+    Serial.println("[CAM] prints at boot into MAIN_ESP_MAC, and reflash.");
+    Serial.println("[CAM] Detection still works; the fan will never move.");
+    Serial.println("[CAM] ***********************************************");
+  }
+
   if (esp_now_init() != ESP_OK) {
     Serial.println("[CAM] ESP-NOW init failed");
     return false;
@@ -345,6 +425,18 @@ static bool initEspNow() {
   memcpy(peer.peer_addr, MAIN_ESP_MAC, 6);
   peer.channel = WIFI_CHANNEL;   // must match the receiver's channel
   peer.encrypt = false;          // an ESP8266 receiver needs encryption off
+
+  // Which radio interface the packet leaves by. Zero-initialising the struct
+  // sets this to WIFI_IF_STA, and with ENABLE_WEB_VIEWER the sketch runs
+  // WiFi.mode(WIFI_AP) -- so the station interface is never started and every
+  // send fails with ESP_ERR_ESPNOW_IF. The symptom is a board that classifies
+  // perfectly and never delivers anything, with "This board's MAC" printing
+  // as 00:00:00:00:00:00 because the STA interface has no address.
+#if ENABLE_WEB_VIEWER
+  peer.ifidx = WIFI_IF_AP;
+#else
+  peer.ifidx = WIFI_IF_STA;
+#endif
 
   if (esp_now_add_peer(&peer) != ESP_OK) {
     Serial.println("[CAM] Failed to add the main board as a peer");
@@ -359,7 +451,13 @@ static void sendResult() {
   packet.crop_id    = g_cropId;
   packet.confidence = g_confidence;
   packet.seq        = g_seq;
-  esp_now_send(MAIN_ESP_MAC, (uint8_t *)&packet, sizeof(packet));
+  esp_err_t err = esp_now_send(MAIN_ESP_MAC, (uint8_t *)&packet, sizeof(packet));
+  if (err != ESP_OK) {
+    // Distinct from the send *callback*, which reports whether the frame was
+    // acknowledged. This is the local call failing outright -- wrong interface,
+    // peer not added, ESP-NOW not started.
+    Serial.printf("[CAM] esp_now_send failed locally: %s\n", esp_err_to_name(err));
+  }
 }
 #endif  // ENABLE_ESPNOW
 
@@ -418,17 +516,24 @@ async function tick(){
     document.getElementById('seq').textContent = '#' + s.seq;
     document.getElementById('warn').hidden = s.model_ok;
     document.getElementById('foot').textContent =
-      'frame ' + (s.image_bytes/1024).toFixed(1) + ' KB · new capture every ' +
-      (s.interval_ms/1000) + ' s · fan acts at ' + s.threshold + '% and above';
+      'frame ' + (s.image_bytes/1024).toFixed(1) + ' KB · capture #' + s.cap +
+      ' · ' + (s.interval_ms ? 'every ' + (s.interval_ms/1000) + ' s'
+                             : 'back to back, ' + (1000/Math.max(1,s.prep_ms+s.infer_ms)).toFixed(2) + ' fps') +
+      ' · fan acts at ' + s.threshold + '% and above';
     document.getElementById('diag').textContent =
       'prep ' + s.prep_ms + ' ms · inference ' + s.infer_ms + ' ms · arena ' +
       (s.arena_used/1024).toFixed(0) + ' KB · mean RGB ' +
       s.mean_r + ', ' + s.mean_g + ', ' + s.mean_b;
-    document.getElementById('shot').src = '/capture?s=' + s.seq;
+    // Keyed to the capture counter, not the detection counter, so a frame that
+    // failed to classify still refreshes the picture instead of freezing it.
+    document.getElementById('shot').src = '/capture?s=' + s.cap;
   }catch(e){}
 }
 tick();
-setInterval(tick, 1500);
+// Polling faster than the board can answer just piles up requests that time
+// out during the inference window and makes the page look more broken, not
+// less. This roughly matches one cycle.
+setInterval(tick, 1200);
 </script></body></html>
 )HTML";
 
@@ -452,14 +557,18 @@ static void handleStatus() {
   uint8_t mr, mg, mb;
   cropModelLastMeanRGB(&mr, &mg, &mb);
 
-  char json[384];
+  // Sized with room to spare: snprintf truncates rather than overflows, but a
+  // truncated response is invalid JSON and the page just silently stops
+  // updating, which looks like a hung board rather than a full buffer.
+  char json[512];
   snprintf(json, sizeof(json),
            "{\"crop_id\":%u,\"crop\":\"%s\",\"confidence\":%u,\"seq\":%lu,"
+           "\"cap\":%lu,"
            "\"image_bytes\":%u,\"interval_ms\":%u,\"threshold\":%u,"
            "\"model_ok\":%s,\"prep_ms\":%lu,\"infer_ms\":%lu,"
            "\"arena_used\":%u,\"mean_r\":%u,\"mean_g\":%u,\"mean_b\":%u}",
            g_cropId, CROP_NAMES[g_cropId], g_confidence,
-           (unsigned long)g_seq, (unsigned)g_jpegLen,
+           (unsigned long)g_seq, (unsigned long)g_capSeq, (unsigned)g_jpegLen,
            DETECT_INTERVAL_MS, CONFIDENCE_THRESHOLD,
            g_modelOk ? "true" : "false",
            (unsigned long)cropModelLastPrepMs(),
@@ -546,8 +655,15 @@ void setup() {
 #endif
 
 #if ENABLE_ESPNOW
-  Serial.print("[CAM] This board's MAC: ");
+  // Print the address of the interface ESP-NOW actually transmits on. The
+  // station MAC reads as all zeros in AP mode and is misleading here.
+#if ENABLE_WEB_VIEWER
+  Serial.print("[CAM] This board's SoftAP MAC: ");
+  Serial.println(WiFi.softAPmacAddress());
+#else
+  Serial.print("[CAM] This board's station MAC: ");
   Serial.println(WiFi.macAddress());
+#endif
   initEspNow();
 #endif
 }
