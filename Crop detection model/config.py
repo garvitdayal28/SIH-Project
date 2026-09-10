@@ -95,11 +95,53 @@ EXCLUDED_CLASSES = ["sweetcorn"]
 # optional but it is the single cheapest accuracy win once the rig exists.
 BACKGROUND_DIR = DATA_RAW / "background"
 
+# Extra images for specific crops, folded into the TRAIN split only.
+#
+# Train-only is deliberate. Validation and test must keep coming from a single
+# consistent distribution, otherwise the accuracy number stops being comparable
+# to anything measured before.
+#
+# Contents: raw, whole produce ONLY. The camera will see loose crops in a tray,
+# so a photograph of chips, ketchup or a cocktail teaches the wrong thing --
+# it widens each class until "potato" starts to mean "anything potato-ish".
+#
+# Sources:
+#   Open Images V7 -- real photographs in varied contexts. For apple, banana,
+#   lemon, potato and tomato it ships bounding boxes, so each photo yields
+#   several framings: the whole scene (often several items), the object with
+#   context, and the object filling the frame. Corn, ginger and onion have
+#   image-level labels only and get whole scenes.
+#
+#   Wikimedia Commons -- used for the three crops Open Images covers poorly.
+#
+# Three filters were applied, in order:
+#   1. Label filter. Any photo carrying a prepared-food or drink label was
+#      dropped (747 images: Juice 151, Cocktail 132, Cheese 116, Drink 101,
+#      Pizza 53, Bread 46, Salad 43, French fries 31, ...).
+#   2. Visual filter. Open Images' human labels are sparse -- a plate of roast
+#      potatoes may carry only "Potato" -- so a full ImageNet classifier
+#      rejected another 99 whose top prediction was a cooked dish, a drink or
+#      a non-food object. Container classes (crate, basket, tray) were
+#      deliberately NOT blocked: a crate of apples is exactly the multiple-item
+#      case the camera will see.
+#   3. Hand review. The Commons images were reviewed by eye and picked
+#      individually, because searching "ginger" also returns ginger plants,
+#      gingerbread, ginger ale and a person named Ginger. Yield was low:
+#      28 of 135 for ginger, 31 of 153 for onion, 40 of 145 for corn.
+#
+# Open Images' own "ginger" label included a photograph of carrots. It was
+# caught in hand review and dropped.
+#
+# Ginger remains the weak class: 28 usable extra images against 300-670 for the
+# others, because neither source has much whole raw ginger. It is the one crop
+# where your own ESP32-CAM captures would make a decisive difference.
+EXTRA_TRAIN_DIRS = {c: DATA_RAW / "extra" / c for c in TARGET_CROPS}
+
 # The 24 unknown-source classes together hold ~24x more images than any single
 # crop. Left alone that imbalance would teach the model to answer "unknown" for
 # everything. We cap the unknown class at this multiple of the average crop
 # class size, sampling evenly across the source classes.
-UNKNOWN_SIZE_MULTIPLIER = 1.5
+UNKNOWN_SIZE_MULTIPLIER = 1.0
 
 
 def class_names():
@@ -261,3 +303,22 @@ CONFIDENCE_THRESHOLD = 0.60
 # --------------------------------------------------------------------------
 
 MAX_MODEL_BYTES = 1200 * 1024
+
+# Cap on how many extra images a single crop may absorb from EXTRA_TRAIN_DIRS.
+#
+# Measured with the 8 crop classes' val/test held identical throughout.
+# "held-out" is Open Images photos never trained on, grouped by SOURCE
+# photograph so no framing of a training image can leak into it.
+#
+#     training data                    Kaggle test   held-out   real photos
+#     Kaggle only                          88.2%       32.8%       6/9
+#     + Open Images, unfiltered            90.9%       65.5%       7/9
+#     + Open Images, raw produce only      89.8%       65.0%       7/9
+#
+# The last row is what ships. Filtering out prepared food cost essentially
+# nothing on the held-out set once the thin classes were topped up from
+# Commons, and it removes an entire class of confusion the deployment would
+# otherwise inherit.
+#
+# 100 keeps the imbalance at 2.02x, with ginger the smallest class.
+EXTRA_TRAIN_MAX_PER_CROP = 100

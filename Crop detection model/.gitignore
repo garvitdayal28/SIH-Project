@@ -10,3 +10,7 @@ models/*.tflite
 models/model_data.cc
 
 outputs/
+
+data/raw/extra/
+data/raw/extra_holdout/
+data/raw/_rejected_*/

@@ -200,11 +200,59 @@ def build_plan(raw_root: Path, rng: random.Random):
             plan["val"][crop] = val_part
             plan["test"][crop] = test_part
 
+    # --- extra images for specific crops -------------------------------------
+    add_extra_train_images(plan)
+
     # --- the unknown class ---------------------------------------------------
     if config.INCLUDE_UNKNOWN:
         add_unknown_class(plan, by_split, had_splits, rng)
 
     return plan
+
+
+def add_extra_train_images(plan) -> None:
+    """Fold config.EXTRA_TRAIN_DIRS into the train split.
+
+    Train only, never val or test -- see the note in config.py. Keeping the
+    evaluation splits on one distribution is what makes an accuracy number
+    before and after adding data mean the same thing.
+    """
+    extras = getattr(config, "EXTRA_TRAIN_DIRS", {})
+    if not extras:
+        return
+
+    for crop, directory in sorted(extras.items()):
+        directory = Path(directory)
+        if not directory.exists():
+            continue
+
+        if crop not in config.TARGET_CROPS and crop != config.UNKNOWN_CLASS:
+            print(f"\nWARNING: EXTRA_TRAIN_DIRS has {crop!r}, which is not a "
+                  f"target crop. Ignoring it.")
+            continue
+
+        found = [
+            p for p in sorted(directory.rglob("*"))
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+
+        # Cap how many extras any one crop may absorb. Without it the two
+        # classes being topped up end up several times larger than the rest,
+        # and the imbalance costs more on the other classes than the extra
+        # data wins on these two. The stride samples across the sorted list
+        # rather than truncating it, which keeps the spread of varieties --
+        # filenames are variety-prefixed, so consecutive files are the same
+        # physical fruit.
+        cap = getattr(config, "EXTRA_TRAIN_MAX_PER_CROP", 0)
+        if cap and len(found) > cap:
+            step = len(found) / cap
+            found = [found[int(i * step)] for i in range(cap)]
+
+        if found:
+            before = len(plan["train"][crop])
+            plan["train"][crop].extend(found)
+            print(f"  extra {crop}: +{len(found)} train images "
+                  f"({before} -> {before + len(found)})")
 
 
 def report_unused_classes(by_split) -> None:

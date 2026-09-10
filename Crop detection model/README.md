@@ -10,7 +10,7 @@ See [FarmFrost_Firmware_V1_Overview.md](../FarmFrost_Firmware_V1_Overview.md)
 for the wider system and [OPTIONS.md](OPTIONS.md) for why each choice was made.
 
 ```text
-image file  ->  centre-crop + resize 96x96  ->  int8 MobileNetV2  ->  top-5 crops
+image file  ->  centre-crop + resize 96x96  ->  int8 MobileNetV1  ->  top-5 crops
 ```
 
 ## Configuration in force
@@ -31,9 +31,25 @@ tray or a vegetable it does not handle. `sweetcorn` is the one exception: it is
 the same vegetable as `corn`, so using it as a negative would teach the model to
 reject real corn. It is excluded outright (`EXCLUDED_CLASSES` in config.py).
 
-Measured on the held-out test set: **88.2% top-1, 100% top-5** for the int8
-model — the same bytes that run on the board. Of the 93 test images, 5.4% are
-both wrong and confident enough that the fan would act on them.
+Measured for the int8 model — the same bytes that run on the board:
+
+| | Kaggle test (88) | held-out Open Images (420) |
+|---|---:|---:|
+| Kaggle data only | 88.2% | 32.8% |
+| **+ extra data, raw produce only** | **89.8%** | **65.0%** |
+
+Top-5 is 96.6% / 96.0%.
+
+All 8 crops are topped up (see `EXTRA_TRAIN_DIRS` in config.py) with real
+photographs in varied framings — whole scenes with several items, objects with
+context, and objects filling the frame. The extra data is **raw whole produce
+only**: images of chips, sauces, cocktails and cooked dishes were filtered out,
+because the camera sees loose crops in a tray and training on prepared food
+widens each class until "potato" starts to mean "anything potato-ish".
+
+Ginger is the weak class — 96 training images against ~180 for the others.
+Neither Open Images nor Wikimedia Commons has much whole raw ginger, and it is
+the crop where your own captures would matter most.
 
 The exported model measures **968 KB int8**. It is linked into the app binary,
 so the firmware needs a custom partition table with roughly a 2.5 MB app
@@ -75,6 +91,21 @@ Kaggle CLI if you have an API token in `~/.kaggle/kaggle.json`:
 You should end up with `data/raw/train/`, `data/raw/validation/` and
 `data/raw/test/`, each holding 36 class folders. An extra level of nesting is
 fine — `prepare_data.py` looks a couple of directories deep.
+
+### Extra images from Open Images
+
+`data/raw/extra/<crop>/` is folded into the **training split only**, capped by
+`EXTRA_TRAIN_MAX_PER_CROP`. Val and test stay on the Kaggle distribution so
+accuracy numbers remain comparable across experiments.
+
+`data/raw/extra_holdout/<crop>/` is 519 Open Images photos never trained on,
+split by **source photograph** — the tight and wide crops of one photo are
+near-duplicates, so splitting them across train and eval would leak and flatter
+the number. It is the more realistic of the two evaluations: larger than the
+Kaggle test set and full of cluttered, multi-object scenes.
+
+This is also where your own ESP32-CAM captures should go once you have the
+hardware, and for ginger it is the only way to close the gap.
 
 ### Optional but worth it: background images
 
