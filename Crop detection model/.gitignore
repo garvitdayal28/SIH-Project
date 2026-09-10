@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+data/raw/
+data/prepared/
+
+models/*.keras
+models/*.tflite
+models/model_data.cc
+
+outputs/

@@ -1,0 +1,9 @@
+apple
+banana
+corn
+ginger
+lemon
+onion
+potato
+tomato
+unknown

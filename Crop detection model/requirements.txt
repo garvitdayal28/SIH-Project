@@ -1,0 +1,17 @@
+# Python 3.11 required.
+#
+# TensorFlow publishes no wheels for Python 3.14, which is the only interpreter
+# that was on this machine originally. Create the venv explicitly against 3.11:
+#
+#     py -3.11 -m venv .venv
+#     .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# Pinned exactly: installing tf-keras or tfmot will happily upgrade TensorFlow
+# out from under you, and 2.20 removes tf.lite.Interpreter.
+tensorflow==2.19.1
+
+numpy>=1.26,<3
+Pillow>=10.0
+matplotlib>=3.8
+scikit-learn>=1.4
+tqdm>=4.66
