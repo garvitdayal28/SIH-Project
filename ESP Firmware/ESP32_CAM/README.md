@@ -1,9 +1,17 @@
 # ESP32-CAM — FarmFrost V1
 
-Capture → (crop model) → desktop viewer + ESP-NOW.
+Capture → crop model → desktop viewer + ESP-NOW.
 
-Right now the capture and the viewer are real; the crop model is a placeholder
-that rotates through the crop list so the rest of the pipeline can be tested.
+The MobileNetV1 α=0.5 96×96 int8 model trained in `Crop detection model` runs
+**on the board**. No laptop, no server, no internet in the loop.
+
+| File | What it is |
+|---|---|
+| `ESP32_CAM.ino` | Camera, Wi-Fi viewer, ESP-NOW, the detection cycle |
+| `crop_model.h/.cpp` | TFLite Micro + the preprocessing that matches `preprocess.py` |
+| `model_data.cpp/.h` | The model itself, as a C array. Generated — never hand-edit |
+
+---
 
 ## 1. One-time Arduino IDE setup
 
@@ -15,18 +23,109 @@ that rotates through the crop list so the rest of the pipeline can be tested.
    **esp32 by Espressif Systems**. (Large download, ~1 GB on disk.)
 3. Select these under **Tools**:
 
-   | Setting | Value |
-   |---|---|
-   | Board | AI Thinker ESP32-CAM |
-   | PSRAM | Enabled |
-   | Partition Scheme | Huge APP (3MB No OTA/1MB SPIFFS) |
-   | Upload Speed | 921600 (drop to 115200 if it fails) |
+   | Setting | Value | Why |
+   |---|---|---|
+   | Board | AI Thinker ESP32-CAM | |
+   | PSRAM | **Enabled** | The 600 KB tensor arena lives there |
+   | Partition Scheme | **Huge APP (3MB No OTA/1MB SPIFFS)** | The model alone is ~968 KB |
+   | Upload Speed | 921600 (drop to 115200 if it fails) | |
 
-   The partition scheme matters later, not now — the crop model is ~968 KB and
-   will not fit the default 1 MB app partition. Setting it now means nothing
-   changes when the model goes in.
+Both bold settings are **required**, not preferences. With the default
+partition scheme the link step fails with "text section exceeds available
+space"; without PSRAM the arena allocation fails at boot and you get
+`[CV] No PSRAM. This model cannot run on this module.`
 
-## 2. Wiring for upload
+## 2. Install the TFLite Micro library
+
+**Tools → Manage Libraries**, search `tflm_esp32`, install
+**tflm_esp32 by Simone Salerno** (version 2.0.0 is what this was built
+against).
+
+This is the one that works. Some notes, because the landscape is confusing:
+
+- **`esp-tflite-micro`** is Espressif's own and is the best of them — but it is
+  an **ESP-IDF component only**. `idf.py add-dependency`. It cannot be added to
+  the Arduino IDE, and it is *not* bundled with the ESP32 Arduino core, despite
+  a widely-copied claim that it is.
+- **`Arduino_TensorFlowLite_ESP32`** (tanakamasayuki) is deprecated and predates
+  ESP32 core 3.x. `crop_model.cpp` still has a compatibility branch for its
+  older `ErrorReporter` API, but it is untested.
+
+`crop_model.cpp` detects which library is present with `__has_include` and
+adapts. The unconditional `#include <tflm_esp32.h>` near the top of the `.ino`
+is *not* redundant — see the comment there. It is what makes Arduino's library
+resolver find the library at all.
+
+### You must patch the library once after installing
+
+`tflm_esp32` 2.0.0 ships its entire **signal** subsystem twice: flattened as
+`.cc` files at `src/` and `src/kiss_fft_wrappers/`, and again in its proper tree
+as `.cpp` under `src/signal/src/`. Arduino compiles both sets, and the build
+dies at link time with pages of:
+
+```
+multiple definition of `tflm_signal::RfftInt32Init(long, void*, unsigned int)'
+multiple definition of `kiss_fft_fixed16::kiss_fftr_alloc(...)'
+```
+
+This is a packaging bug in the library, not in this sketch. The nested
+`signal/src/` tree is the complete one and is what every include in the library
+actually references, so rename the flattened copies out of the build — 25 files
+in two folders:
+
+```bash
+cd ~/Documents/Arduino/libraries/tflm_esp32/src
+for f in *.cc kiss_fft_wrappers/*.cc; do mv "$f" "$f.disabled"; done
+```
+
+PowerShell equivalent:
+
+```powershell
+cd ~\Documents\Arduino\libraries\tflm_esp32\src
+Get-ChildItem *.cc, kiss_fft_wrappers\*.cc | Rename-Item -NewName { $_.Name + '.disabled' }
+```
+
+**This has already been done on this machine.** You only need it again after
+reinstalling or updating the library.
+
+Then **clean the build cache** — this part is easy to miss. Arduino keeps
+compiled library objects in an archive keyed to the sketch, and renaming a
+source file does not evict the `.o` that was already built from it. The link
+keeps failing with exactly the same errors and it looks like the rename did not
+work. In the IDE: **Sketch → Clean**. Or delete the cached build folder under
+`%LOCALAPPDATA%\arduino\sketches\`.
+
+Keep every `.h` — they are still included. The disabled files are FFT and
+filter-bank helpers for audio models; nothing in the crop pipeline touches them.
+If a future version fixes the packaging, the rename becomes unnecessary rather
+than harmful — but check for `.disabled` files before reporting a build error.
+
+## 3. Deploy the model
+
+The model is already deployed — `model_data.cpp` and `model_data.h` are in this
+folder and ready to compile. **You only need this section after retraining.**
+
+```bash
+cd "Crop detection model"
+python scripts/export_tflite.py     # model.keras  -> model_int8.tflite
+python scripts/export_c_array.py    # .tflite      -> model_data.cc/.h
+
+cp models/model_data.h  "../ESP Firmware/ESP32_CAM/model_data.h"
+cp models/model_data.cc "../ESP Firmware/ESP32_CAM/model_data.cpp"
+```
+
+**The `.cc` → `.cpp` rename is required.** The Arduino build compiles `.c`,
+`.cpp`, `.S` and `.ino` files in a sketch folder — `.cc` is silently ignored.
+Leave it as `.cc` and the build fails at link time with `undefined reference to
+g_crop_model_data`, which does not obviously point at a file extension.
+
+`model_data.h` also carries the label list and the class enum, and the sketch
+uses them directly rather than keeping its own copy. That is deliberate: the
+index **is** the `crop_id` on the wire, so a sketch-side table that drifted one
+position from the model would silently make the main board run the wrong fan
+profile for every crop.
+
+## 4. Wiring for upload
 
 The ESP32-CAM has no USB port, so it needs a USB-TTL (FTDI/CP2102) adapter set
 to **5 V** or with a separate 5 V supply:
@@ -44,39 +143,94 @@ RTS pin...` appears, remove the GPIO0 jumper and press RESET again. The sketch
 does not run while GPIO0 is grounded — that is flash mode.
 
 Do not power the camera from a 3.3 V pin. It browns out the moment the radio
-transmits.
+transmits. The model makes this worse, not better: inference holds the CPU at
+full clock for seconds at a time.
 
-## 3. Seeing the image on the desktop
+> First compile takes several minutes — TFLM is built from source. Later builds
+> are cached and much faster.
 
-The board makes its own Wi-Fi network — no router, no internet, which keeps the
-offline requirement in the spec intact.
-
-1. Open Serial Monitor at **115200 baud**. You should see:
-   ```
-   [CAM] FarmFrost ESP32-CAM starting
-   [CAM] PSRAM: found
-   [CAM] Camera ready
-   [CAM] Desktop viewer ready
-   [CAM]   1. Connect this computer to Wi-Fi "FarmFrost-CAM" (password: farmfrost)
-   [CAM]   2. Open http://192.168.4.1
-   ```
-2. Connect the laptop's Wi-Fi to **FarmFrost-CAM** / `farmfrost`.
-   Windows will warn "No internet, open anyway" — that is expected and fine.
-3. Open <http://192.168.4.1>.
-
-The page shows the captured frame plus the crop, confidence and frame number,
-refreshing every 3 s. The image you see is always the exact frame that was
-classified, not a newer one, so picture and reading never disagree.
-
-Serial keeps logging regardless:
+This build is verified. On ESP32 core 3.3.11 with `tflm_esp32` 2.0.0 it links at:
 
 ```
-[CAM] Image captured (28714 bytes)
-[CAM] Crop: TOMATO (placeholder)
-[CAM] Confidence: 92%
+Sketch uses 2094785 bytes (66%) of program storage space. Maximum is 3145728 bytes.
+Global variables use 90344 bytes (27%) of dynamic memory, leaving 237336 bytes
+for local variables. Maximum is 327680 bytes.
 ```
 
-## 4. Turning on ESP-NOW
+66% of flash with the model in it, and 27% of internal RAM before the arena —
+which is the whole reason the arena goes in PSRAM instead.
+
+You will also see this, twice, and it is harmless:
+
+```
+Library tflm_esp32 has been declared precompiled:
+Precompiled library in ".../tflm_esp32/src/esp32" not found
+```
+
+The library ships a prebuilt archive for the ESP32-**S3** only. For plain ESP32
+there is nothing to find, so it falls back to compiling from source — which is
+what you want, and why the first build is slow.
+
+## 5. What a good boot looks like
+
+Serial Monitor at **115200 baud**:
+
+```
+[CAM] FarmFrost ESP32-CAM starting
+[CAM] PSRAM: found
+[CAM] Camera ready
+[CV] Model loaded: 991560 bytes of weights
+[CV] Arena used: 233472 of 614400 bytes
+[CV] Input  int8 96x96x3, scale 1.000000 zp -128
+[CV] Output int8 9 classes, scale 0.003906 zp -128
+[CAM] Desktop viewer ready
+[CAM]   1. Connect this computer to Wi-Fi "FarmFrost-CAM" (password: farmfrost)
+[CAM]   2. Open http://192.168.4.1
+```
+
+Then every 5 s:
+
+```
+[CAM] Image captured (320x240, 11482 bytes)
+[CAM] Crop: tomato
+[CAM] Confidence: 87%
+[CAM] prep 61ms, infer 1840ms | mean RGB 142,98,71
+```
+
+Once it is running, **`Arena used:` tells you what to set `CROP_ARENA_BYTES` to**
+in `crop_model.h` — that figure plus ~10%. The 600 KB default is deliberately
+generous because `AllocateTensors()` failing is a hard stop.
+
+## 6. Seeing it on the desktop
+
+The board makes its own Wi-Fi network — no router, no internet, so the offline
+requirement in the spec stays intact.
+
+1. Connect the laptop's Wi-Fi to **FarmFrost-CAM** / `farmfrost`.
+   Windows warns "No internet, open anyway" — expected.
+2. Open <http://192.168.4.1>.
+
+The page shows the captured frame plus crop, confidence, timings and the mean
+RGB check. The image is always the exact frame that was classified, never a
+newer one, so the picture and the reading never disagree.
+
+### Check the colour channels before trusting any accuracy number
+
+The page prints **mean RGB** of the 96×96 tensor the model actually received.
+Point the camera at something strongly red — a tomato, a red cloth. **R should
+come back clearly above B.**
+
+If they are reversed, set `CROP_SWAP_RB` to `0` in `crop_model.h` and reflash.
+
+This is worth doing once, deliberately, because the failure is silent. The
+esp32-camera JPEG decoder emits **BGR**, not RGB — its converter is shared with
+the BMP writer, where BGR is the on-disk format. The model was trained on RGB.
+Feed it BGR and nothing errors; you just get a model that is quietly much worse,
+and `config.py` notes that onion, potato and ginger are separated mainly *by*
+their brown/tan colour. `CROP_SWAP_RB` defaults to `1` on the assumption that
+the decoder is doing this. Verify rather than assume.
+
+## 7. Turning on ESP-NOW
 
 Off by default because it needs the main board's MAC address.
 
@@ -95,30 +249,38 @@ Only `crop_id` + `confidence` + `seq` are sent — 6 bytes. **The image is never
 sent.** ESP-NOW caps a payload at 250 bytes, and section 2 of the spec rules it
 out anyway; the main board has no use for pixels.
 
-## 5. Replacing the placeholder model
+## 8. Performance, and what is honest about it
 
-`runInference()` is the only function that changes. It must reproduce what
-`Crop detection model/cropnet/preprocess.py` does on the desktop, or the model
-sees a different picture than it was trained on:
+Expect **roughly 1.5–4 s per inference** on this board. The plain ESP32 has no
+vector unit (that is the S3), and the arena sits in PSRAM, which is several
+times slower than internal SRAM. `DETECT_INTERVAL_MS` is 5000 to leave room.
 
-1. Decode JPEG → RGB (`fmt2rgb888()` from `img_converters.h`, or capture a
-   second frame as `PIXFORMAT_RGB565`).
-2. Centre-crop to a square.
-3. Downscale to 96×96 (`config.IMAGE_SIZE`).
-4. int8 quantize, run with **esp-tflite-micro**.
-5. Return argmax + softmax as 0–100.
+`loop()` is single-threaded, so **the web page stops responding during
+inference** and will skip a poll every cycle. That is expected here, not a bug.
 
-The crop table in the sketch is in the same order as `class_names()` in
-`config.py` — crops alphabetically, then `unknown` last. The index **is** the
-`crop_id`, so it cannot be rearranged without retraining.
+If it needs to be faster:
+
+- `ESP_TF` (Library Manager) bundles **esp-nn**, Espressif's optimised kernels.
+  Meaningful speedup, and `crop_model.cpp` should build against it unchanged.
+- Retrain at α=0.35, or at 64×64 instead of 96×96.
+- An ESP32-**S3** board would be several times quicker on the same model.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
+| `#error "No TensorFlow Lite Micro library found"` | `tflm_esp32` not installed — section 2. |
+| `multiple definition of tflm_signal::...` or `kiss_fft_...` | The library's duplicated signal sources. Patch it — section 2. |
+| `undefined reference to g_crop_model_data` | `model_data` is still `.cc`. Rename to `.cpp` — section 3. |
+| `text section exceeds available space` | Partition Scheme is not Huge APP. |
+| `[CV] No PSRAM` | PSRAM disabled under Tools, or a module without it. |
+| `[CV] AllocateTensors failed` | Raise `CROP_ARENA_BYTES` in `crop_model.h`. |
+| `[CV] Model schema N, library expects M` | Library and export are different TFLM generations. Re-export, or change library version. |
+| Every crop reads as one class, high confidence | Almost always the R/B swap — section 6. |
+| Confidence always low | Lighting, or the object is not filling the centre square. The viewer shows the full frame; the model only sees the centre crop. |
 | `Camera init failed: 0x105` | Ribbon cable not seated, or 3.3 V power. Reseat, use 5 V. |
 | Board reboots in a loop | Brownout. Needs a supply that can do ~500 mA at 5 V. |
 | `Failed to connect... Timed out waiting for packet header` | GPIO0 not grounded, or RESET not pressed before upload. |
 | Sketch never starts, only garbage on serial | GPIO0 still grounded after upload. |
 | Red LED blinking fast forever | Camera init failed — the sketch halted deliberately. |
-| Page loads but image is broken | Wait one detection cycle; nothing is captured for the first ~3 s. |
+| Page loads but image is broken | Wait one detection cycle; nothing is captured for the first few seconds. |

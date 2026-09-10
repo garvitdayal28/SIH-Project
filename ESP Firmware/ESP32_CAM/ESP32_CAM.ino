@@ -18,22 +18,24 @@
  *     3. ESP-NOW         -- crop_id + confidence to the main board. Off until
  *                           you fill in the main board's MAC (see below).
  *
- * What is still a placeholder
+ * The model
  *
- *   runInference() returns rotating fake results. The TFLite Micro model from
- *   "Crop detection model" is not linked in yet -- that is Step 4 of the spec.
- *   Everything the fake result touches (logging, web page, ESP-NOW packet) is
- *   real, so swapping the model in later is a one-function change.
- *   The web page labels itself PLACEHOLDER so a fake reading is never mistaken
- *   for a real one.
+ *   Real inference, running on the board. The MobileNetV1 alpha=0.5 96x96
+ *   int8 model trained in "Crop detection model" is compiled into the binary
+ *   as model_data.cpp and run by TensorFlow Lite Micro. All of that lives in
+ *   crop_model.cpp; this file only asks it for a crop and a confidence.
+ *
+ *   Two things it needs that a plain sketch does not: a TFLM library (see
+ *   README section 2) and PSRAM, which holds the ~600 KB tensor arena.
  *
  * Flashing from the Arduino IDE
  *
  *   Boards Manager  : esp32 by Espressif Systems
  *   Board           : "AI Thinker ESP32-CAM"
- *   Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)"   <- needed later for
- *                     the model; set it now so nothing changes at Step 4.
- *   PSRAM           : Enabled
+ *   Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)"   <- required. The
+ *                     model alone is ~970 KB; the default 1.2 MB app partition
+ *                     will not hold it and the build fails at link time.
+ *   PSRAM           : Enabled   <- required, the arena will not fit without it
  *   Upload Speed    : 115200 if 921600 fails
  *
  *   Wiring to the USB-TTL adapter (the CAM has no USB port):
@@ -56,6 +58,20 @@
 // Disabling it is the standard fix; a decent 5V supply is the real fix.
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+
+// Nothing in this file uses TFLite directly -- crop_model.cpp does. The include
+// has to be here anyway, because of how Arduino finds libraries: it compiles,
+// looks for an include it could not satisfy, adds the library that provides it,
+// and repeats. crop_model.cpp guards its include with __has_include, which by
+// design never fails, so the resolver would never notice the library existed
+// and the build would stop at "No TensorFlow Lite Micro library found".
+//
+// Install it from the Library Manager as "tflm_esp32". If you switch to a
+// different TFLM port, this is the line to change -- crop_model.cpp already
+// adapts to the two common API shapes on its own.
+#include <tflm_esp32.h>
+
+#include "crop_model.h"
 
 // ==========================================================================
 // Configuration
@@ -84,7 +100,14 @@ static uint8_t MAIN_ESP_MAC[6] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
 #define WIFI_CHANNEL        1
 
 // --- Detection cycle ------------------------------------------------------
-#define DETECT_INTERVAL_MS  3000
+// Inference is not free -- expect roughly 1.5-4 s per frame on a plain ESP32
+// (no vector unit, and the arena lives in the slower PSRAM). loop() is
+// single-threaded, so the web server stops responding for that whole window
+// and the page will occasionally skip a poll. That is expected on this chip.
+//
+// The real per-frame cost is printed every cycle as "prep Nms, infer Nms".
+// Set this to comfortably more than their sum.
+#define DETECT_INTERVAL_MS  5000
 
 // Below this the main board keeps its previous fan state. Mirrors
 // CONFIDENCE_THRESHOLD = 0.60 in "Crop detection model/config.py".
@@ -97,25 +120,22 @@ static uint8_t MAIN_ESP_MAC[6] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
 // ==========================================================================
 // Crop table
 //
-// The order here is the model's output order, defined by class_names() in
-// "Crop detection model/config.py": crops alphabetically, then unknown last.
-// The integer index IS the crop_id sent over ESP-NOW, so this order must not
-// be rearranged without retraining.
+// Comes from model_data.h, which export_c_array.py generates from the same
+// labels.txt the model was trained against -- CROP_NAMES, CROP_COUNT and
+// CROP_UNKNOWN below are all defined there.
+//
+// This used to be a hand-written list. It is generated now because it cannot
+// be allowed to drift: the index IS the crop_id on the wire, so a table that
+// disagreed with the model by one position would make the main board run the
+// wrong fan profile for every crop, with nothing anywhere reporting an error.
+//
+// The main board has its own copy of the order in its fan-speed table. That
+// one is still manual, so if the classes ever change, change it too.
 // ==========================================================================
 
-static const char *CROP_NAMES[] = {
-  "APPLE",    // 0
-  "BANANA",   // 1
-  "CORN",     // 2
-  "GINGER",   // 3
-  "LEMON",    // 4
-  "ONION",    // 5
-  "POTATO",   // 6
-  "TOMATO",   // 7
-  "UNKNOWN"   // 8
-};
-static const uint8_t CROP_COUNT   = sizeof(CROP_NAMES) / sizeof(CROP_NAMES[0]);
-static const uint8_t CROP_UNKNOWN = CROP_COUNT - 1;
+#include "model_data.h"
+
+#define CROP_NAMES g_crop_labels
 
 // ==========================================================================
 // Camera pinout -- AI-Thinker ESP32-CAM
@@ -162,10 +182,13 @@ typedef struct __attribute__((packed)) {
 
 static uint8_t *g_jpeg       = nullptr;   // copy of the classified frame
 static size_t   g_jpegLen    = 0;
+static uint16_t g_jpegW      = 0;         // its dimensions, needed to decode it
+static uint16_t g_jpegH      = 0;
 static uint8_t  g_cropId     = CROP_UNKNOWN;
 static uint8_t  g_confidence = 0;
 static uint32_t g_seq        = 0;
 static uint32_t g_lastDetectMs = 0;
+static bool     g_modelOk    = false;     // cropModelInit() succeeded
 
 #if ENABLE_WEB_VIEWER
 WebServer server(80);
@@ -199,11 +222,17 @@ static bool initCamera() {
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_LATEST;
 
-  // With PSRAM we can afford a bigger frame and two buffers. Without it the
-  // board still works, just at a smaller size -- worth knowing, because a
-  // module with no PSRAM will not be able to run the model later either.
+  // QVGA rather than something larger, because every captured frame now gets
+  // decoded to RGB888 for the model. That buffer is width*height*3, so SVGA
+  // would cost 1.4 MB of PSRAM and a much slower decode, all to feed a 96x96
+  // input. QVGA centre-crops to 240x240 -- a 2.5x reduction to 96x96, which
+  // is a comfortable ratio for the area-average resize in crop_model.cpp.
+  //
+  // It is also the picture the desktop viewer shows. 320x240 is small but
+  // perfectly legible for checking what the model is looking at. Raising it
+  // costs inference latency, not accuracy: the model sees 96x96 either way.
   if (psramFound()) {
-    config.frame_size   = FRAMESIZE_SVGA;   // 800x600
+    config.frame_size   = FRAMESIZE_QVGA;   // 320x240
     config.jpeg_quality = 12;               // lower number = better quality
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
@@ -253,46 +282,36 @@ static bool captureFrame() {
   }
 
   memcpy(copy, fb->buf, fb->len);
-  size_t copyLen = fb->len;
+  size_t   copyLen = fb->len;
+  uint16_t copyW   = fb->width;
+  uint16_t copyH   = fb->height;
   esp_camera_fb_return(fb);
 
   if (g_jpeg) free(g_jpeg);
   g_jpeg    = copy;
   g_jpegLen = copyLen;
+  g_jpegW   = copyW;
+  g_jpegH   = copyH;
   return true;
 }
 
 // ==========================================================================
-// Inference -- PLACEHOLDER
+// Inference
 //
-// Replace the body with the real thing at Step 4 of the spec. The real version
-// has to do what "Crop detection model/cropnet/preprocess.py" does on the
-// desktop, or the model sees a different picture than it was trained on:
-//
-//   1. Decode the JPEG to RGB     -- jpg2rgb565() / fmt2rgb888() from
-//                                    img_converters.h, or capture a second
-//                                    frame in PIXFORMAT_RGB565 instead.
-//   2. Centre-crop to a square.
-//   3. Downscale to 96x96 (config.IMAGE_SIZE).
-//   4. Quantize to int8 and run the model with esp-tflite-micro.
-//   5. Return argmax and its softmax value as 0-100.
-//
-// Until then this rotates through the crop table so the whole pipeline --
-// logging, web page, ESP-NOW -- can be tested end to end.
+// The work is all in crop_model.cpp -- decode, centre-crop, resize to 96x96,
+// quantize, invoke. This is just the call plus the failure policy.
 // ==========================================================================
 
-static void runInference(const uint8_t *jpeg, size_t len,
+static bool runInference(const uint8_t *jpeg, size_t len,
+                         uint16_t width, uint16_t height,
                          uint8_t *cropId, uint8_t *confidence) {
-  (void)jpeg;
-  (void)len;
+  if (!g_modelOk) return false;
 
-  static uint8_t next = 0;
-  *cropId = next;
-  next = (next + 1) % CROP_COUNT;
-
-  // Unknown deliberately comes back below the threshold, so the "do not act on
-  // a low-confidence reading" path on the main board gets exercised too.
-  *confidence = (*cropId == CROP_UNKNOWN) ? 41 : 92;
+  // On failure the previous crop and confidence stay put. A dropped frame
+  // should look identical to no new frame having arrived yet -- the main board
+  // already holds the last valid state, and inventing an UNKNOWN here would
+  // throw that away over what is usually a transient decode error.
+  return cropModelClassify(jpeg, len, width, height, cropId, confidence);
 }
 
 // ==========================================================================
@@ -372,8 +391,8 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
 </style></head><body><div class="wrap">
 <h1>FARMFROST &mdash; ESP32-CAM</h1>
 <p class="sub">Live capture from the board. No router, no internet.</p>
-<div class="warn">PLACEHOLDER &mdash; the crop model is not flashed yet.
- The image is real; the crop and confidence below are fake test values.</div>
+<div class="warn" id="warn" hidden>The model failed to load &mdash; check the
+ serial monitor for a [CV] line. Nothing below is a real detection.</div>
 <img id="shot" src="/capture" alt="latest capture">
 <div class="grid">
   <div class="card"><div class="label">Detected crop</div>
@@ -384,6 +403,10 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
     <div class="value" id="seq">&mdash;</div></div>
 </div>
 <p class="foot" id="foot"></p>
+<p class="foot" id="diag"></p>
+<p class="foot">Mean RGB is the average colour of the 96&times;96 tensor the
+ model actually saw. Point the camera at something strongly red: R should be
+ clearly above B. If they are swapped, flip CROP_SWAP_RB in crop_model.h.</p>
 </div><script>
 async function tick(){
   try{
@@ -393,9 +416,14 @@ async function tick(){
     c.textContent = s.confidence + '%';
     c.className = 'value' + (s.confidence < s.threshold ? ' low' : '');
     document.getElementById('seq').textContent = '#' + s.seq;
+    document.getElementById('warn').hidden = s.model_ok;
     document.getElementById('foot').textContent =
       'frame ' + (s.image_bytes/1024).toFixed(1) + ' KB · new capture every ' +
       (s.interval_ms/1000) + ' s · fan acts at ' + s.threshold + '% and above';
+    document.getElementById('diag').textContent =
+      'prep ' + s.prep_ms + ' ms · inference ' + s.infer_ms + ' ms · arena ' +
+      (s.arena_used/1024).toFixed(0) + ' KB · mean RGB ' +
+      s.mean_r + ', ' + s.mean_g + ', ' + s.mean_b;
     document.getElementById('shot').src = '/capture?s=' + s.seq;
   }catch(e){}
 }
@@ -421,14 +449,22 @@ static void handleCapture() {
 }
 
 static void handleStatus() {
-  char json[256];
+  uint8_t mr, mg, mb;
+  cropModelLastMeanRGB(&mr, &mg, &mb);
+
+  char json[384];
   snprintf(json, sizeof(json),
            "{\"crop_id\":%u,\"crop\":\"%s\",\"confidence\":%u,\"seq\":%lu,"
            "\"image_bytes\":%u,\"interval_ms\":%u,\"threshold\":%u,"
-           "\"placeholder\":true}",
+           "\"model_ok\":%s,\"prep_ms\":%lu,\"infer_ms\":%lu,"
+           "\"arena_used\":%u,\"mean_r\":%u,\"mean_g\":%u,\"mean_b\":%u}",
            g_cropId, CROP_NAMES[g_cropId], g_confidence,
            (unsigned long)g_seq, (unsigned)g_jpegLen,
-           DETECT_INTERVAL_MS, CONFIDENCE_THRESHOLD);
+           DETECT_INTERVAL_MS, CONFIDENCE_THRESHOLD,
+           g_modelOk ? "true" : "false",
+           (unsigned long)cropModelLastPrepMs(),
+           (unsigned long)cropModelLastInferMs(),
+           (unsigned)cropModelArenaUsed(), mr, mg, mb);
   server.send(200, "application/json", json);
 }
 
@@ -481,6 +517,19 @@ void setup() {
   }
   Serial.println("[CAM] Camera ready");
 
+  // Load the model before Wi-Fi comes up. The arena is a single 600 KB PSRAM
+  // allocation and it is the largest one this sketch makes -- taking it while
+  // the heap is still unfragmented is the difference between it succeeding and
+  // failing intermittently.
+  //
+  // A failure here is not fatal: the camera, the viewer and the serial log all
+  // still work, which is exactly what you need in order to debug why the model
+  // would not load. The page says so rather than showing a stale verdict.
+  g_modelOk = cropModelInit();
+  if (!g_modelOk) {
+    Serial.println("[CAM] Running WITHOUT a model -- images only, no detection");
+  }
+
   // Wi-Fi has to be up before ESP-NOW starts. AP mode both serves the desktop
   // viewer and pins the radio to WIFI_CHANNEL, which is what ESP-NOW needs.
 #if ENABLE_WEB_VIEWER
@@ -515,13 +564,30 @@ void loop() {
   if (!captureFrame()) return;
 
   digitalWrite(STATUS_LED_PIN, LOW);   // on while classifying
-  runInference(g_jpeg, g_jpegLen, &g_cropId, &g_confidence);
+  bool ok = runInference(g_jpeg, g_jpegLen, g_jpegW, g_jpegH,
+                         &g_cropId, &g_confidence);
   digitalWrite(STATUS_LED_PIN, HIGH);
+
+  Serial.printf("[CAM] Image captured (%ux%u, %u bytes)\n",
+                g_jpegW, g_jpegH, (unsigned)g_jpegLen);
+
+  if (!ok) {
+    // Frame kept, result not updated. The web page will show the new picture
+    // beside the previous verdict, which is honest -- nothing was classified.
+    Serial.println("[CAM] Inference failed, keeping previous result");
+    return;
+  }
+
   g_seq++;
 
-  Serial.printf("[CAM] Image captured (%u bytes)\n", (unsigned)g_jpegLen);
-  Serial.printf("[CAM] Crop: %s (placeholder)\n", CROP_NAMES[g_cropId]);
+  uint8_t mr, mg, mb;
+  cropModelLastMeanRGB(&mr, &mg, &mb);
+
+  Serial.printf("[CAM] Crop: %s\n", CROP_NAMES[g_cropId]);
   Serial.printf("[CAM] Confidence: %u%%\n", g_confidence);
+  Serial.printf("[CAM] prep %lums, infer %lums | mean RGB %u,%u,%u\n",
+                (unsigned long)cropModelLastPrepMs(),
+                (unsigned long)cropModelLastInferMs(), mr, mg, mb);
 
 #if ENABLE_ESPNOW
   if (g_confidence >= CONFIDENCE_THRESHOLD) {
