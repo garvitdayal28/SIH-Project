@@ -32,6 +32,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 from cropnet.preprocess import load_image
 
+# Imported for its side effect: registering RandomWhiteBalance so that
+# load_model can rebuild the saved augmentation block. The layer is stripped
+# again in build_inference_model below and never reaches the .tflite file, but
+# the model cannot be loaded at all without the class being known.
+import cropnet.augment  # noqa: F401
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 REPRESENTATIVE_SAMPLES = 300
 

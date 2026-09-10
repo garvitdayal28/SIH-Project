@@ -14,3 +14,5 @@ outputs/
 data/raw/extra/
 data/raw/extra_holdout/
 data/raw/_rejected_*/
+
+my images/

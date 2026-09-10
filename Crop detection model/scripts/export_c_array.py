@@ -17,6 +17,7 @@ needs it yet -- it is what Step 2 of the firmware plan will consume.
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -124,6 +125,26 @@ const char *const g_crop_labels[CROP_MODEL_NUM_CLASSES] = {{
     print(f"Wrote {config.C_ARRAY_SOURCE}")
 
 
+def copy_to_firmware() -> None:
+    """Mirror the generated files into the ESP32-CAM sketch folder.
+
+    The sketch needs model_data.cpp, not .cc -- the Arduino build only compiles
+    .c/.cpp/.ino from a sketch directory, and silently ignores a .cc, which
+    would leave the previous model linked in with no error anywhere.
+    """
+    target = getattr(config, "FIRMWARE_DIR", None)
+    if not target:
+        return
+    target = Path(target)
+    if not target.exists():
+        print(f"\nFirmware folder not found, skipping copy: {target}")
+        return
+
+    shutil.copyfile(config.C_ARRAY_HEADER, target / "model_data.h")
+    shutil.copyfile(config.C_ARRAY_SOURCE, target / "model_data.cpp")
+    print(f"\nCopied model_data.h and model_data.cpp into {target.name}/")
+
+
 def main() -> None:
     if not config.TFLITE_MODEL.exists():
         raise SystemExit(
@@ -135,6 +156,7 @@ def main() -> None:
 
     write_header(labels, len(data))
     write_source(data, labels)
+    copy_to_firmware()
 
     # A C array of N bytes costs about 6N bytes of source text.
     print(f"\nModel: {len(data):,} bytes -> "

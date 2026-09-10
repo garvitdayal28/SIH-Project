@@ -25,6 +25,15 @@ C_ARRAY_SOURCE = MODELS_DIR / "model_data.cc"
 C_ARRAY_HEADER = MODELS_DIR / "model_data.h"
 LABELS_FILE = MODELS_DIR / "labels.txt"
 
+# The ESP32-CAM sketch compiles model_data.h/.cpp from its own folder, so the
+# export copies them there as well as into models/. Keeping this automatic is
+# not tidiness: the firmware was found carrying a stale 9-class model while the
+# trained one had 5, and nothing about that fails loudly -- the sketch compiles,
+# boots, and reports confident nonsense against the wrong label table.
+#
+# Set to None to skip the copy.
+FIRMWARE_DIR = ROOT.parent / "ESP Firmware" / "ESP32_CAM"
+
 # --------------------------------------------------------------------------
 # Input geometry
 #
@@ -45,37 +54,52 @@ INPUT_SHAPE = (IMAGE_SIZE, IMAGE_SIZE, IMAGE_CHANNELS)
 # "Fruit and Vegetable Image Recognition" dataset (kritikseth). Our name is what
 # ends up in labels.txt and in the ESP-NOW crop table; the dataset name is only
 # used while preparing data.
+#
+# The whole class set is now scoped to one physical setup: a fixed ESP32-CAM
+# looking into a small white thermocol box holding exactly one item. See
+# my images/ for what the camera actually returns. Everything below follows from
+# that -- 8 crops, plus `unknown` meaning "the box is empty", and no training
+# data for anything that cannot happen inside the box.
 # --------------------------------------------------------------------------
 
 TARGET_CROPS = {
-    "apple": "apple",
     "banana": "banana",
-    "corn": "corn",
-    "ginger": "ginger",
     "lemon": "lemon",
     "onion": "onion",
-    "potato": "potato",
     "tomato": "tomato",
 }
 
-# The "unknown" class stops the model from confidently reporting a crop when it
-# is shown something else -- an empty tray, a hand, a different vegetable. The
-# Main ESP32 must never change fan speed on a misread, so this class is what
-# gives the confidence threshold in the firmware spec something real to act on.
-UNKNOWN_CLASS = "unknown"
+# The "unknown" class stops the model from confidently reporting a crop when
+# there is no crop to report. The Main ESP32 must never change fan speed on a
+# misread, so this class is what gives the confidence threshold in the firmware
+# spec something real to act on.
+#
+# It means: NOT ONE OF THE 8 CROPS. That covers two different situations, and the
+# class is built from a source for each:
+#
+#   some other produce   -> UNKNOWN_SOURCE_CLASSES, the Kaggle set's other 27
+#                           classes. A pomegranate is not a crop we handle.
+#   nothing at all       -> BACKGROUND_DIR, photographs of the empty box.
+#
+# Both are needed, and the test images in my images/ show why. Three of them are
+# pomegranates, which no amount of empty-box training would reject -- a
+# pomegranate is round, red and fills the frame, so a model that only knows
+# "crop" versus "empty tray" reports it as an apple with 85% confidence. That was
+# measured, not assumed. Equally, the produce negatives alone never show a bare
+# tray, so an emptied tray used to come out as whatever the last crop looked
+# most like.
+UNKNOWN_CLASS = "empty"
 INCLUDE_UNKNOWN = True
 
-# Negative examples for the unknown class: the dataset's other classes. These
-# are real produce photos that are *not* one of our crops, which is exactly the
-# confusion we want the model to learn to reject. They cost nothing -- the
-# images are already downloaded.
-UNKNOWN_SOURCE_CLASSES = [
-    "beetroot", "bell pepper", "cabbage", "capsicum", "carrot", "cauliflower",
-    "chilli pepper", "cucumber", "eggplant", "garlic", "grapes", "jalepeno",
-    "kiwi", "lettuce", "mango", "orange", "paprika", "pear", "peas",
-    "pineapple", "pomegranate", "raddish", "soy beans", "spinach",
-    "sweetpotato", "turnip", "watermelon",
-]
+# Produce classes folded into `unknown` as negatives: everything in the dataset
+# that is not one of the 8 targets. These are the most useful negatives available
+# -- real produce photographs that are not one of our crops -- and they are free,
+# since the images are already downloaded.
+#
+# `pomegranate` earns its place here explicitly. It is the negative the rig is
+# actually tested with, and it is visually the closest of all of them to apple
+# and tomato.
+UNKNOWN_SOURCE_CLASSES = []  # nothing but the 4 crops is ever placed in the box
 
 # Dataset classes deliberately used as NEITHER a target nor a negative.
 #
@@ -90,71 +114,103 @@ UNKNOWN_SOURCE_CLASSES = [
 # nothing gets discarded silently.
 EXCLUDED_CLASSES = ["sweetcorn"]
 
-# Any images you drop in data/raw/background/ (empty trays, crates, the inside of
-# the storage unit, hands, walls) are folded into the unknown class too. This is
-# optional but it is the single cheapest accuracy win once the rig exists.
+# data/raw/background/ holds photographs of the empty box, folded into `unknown`
+# alongside the produce negatives above. This is the "nothing at all" half of the
+# class, and without it the model has never seen a bare tray.
+#
+# scripts/make_background.py generates these from my images/environment/. Anything
+# you drop in here by hand is used as well, and frames captured through the
+# ESP32-CAM itself, at the real mounting distance, are worth far more than
+# generated crops of one phone photo.
 BACKGROUND_DIR = DATA_RAW / "background"
 
-# Extra images for specific crops, folded into the TRAIN split only.
+# Extra images per crop, folded into the TRAIN split only. Deliberately empty.
 #
-# Train-only is deliberate. Validation and test must keep coming from a single
-# consistent distribution, otherwise the accuracy number stops being comparable
-# to anything measured before.
+# This used to point at data/raw/extra/, 2,411 Open Images and Wikimedia photos
+# collected to make the model survive arbitrary real-world photographs of
+# produce. They are no longer used, for two independent reasons.
 #
-# Contents: raw, whole produce ONLY. The camera will see loose crops in a tray,
-# so a photograph of chips, ketchup or a cocktail teaches the wrong thing --
-# it widens each class until "potato" starts to mean "anything potato-ish".
+# The first is that they are photographs of a world this camera cannot see:
+# apples on a tree, a market bin of two hundred onions, a cornfield with people
+# in it. Training on them widens each class until "onion" means "anything
+# onion-ish anywhere", which costs accuracy on the one setting that does occur.
 #
-# Sources:
-#   Open Images V7 -- real photographs in varied contexts. For apple, banana,
-#   lemon, potato and tomato it ships bounding boxes, so each photo yields
-#   several framings: the whole scene (often several items), the object with
-#   context, and the object filling the frame. Corn, ginger and onion have
-#   image-level labels only and get whole scenes.
+# The second is that they are contaminated, and not slightly. From contact
+# sheets of the supposedly clean `_tight` framings -- one labelled object filling
+# the frame -- the potato class contained roast potatoes, chips, mashed potato,
+# potato salad, stew and sweet potatoes, which are a different vegetable; the
+# onion class contained garlic bulbs and spring onions; corn contained popcorn,
+# grilled cobs and a dog. Open Images draws boxes around potatoes that are
+# sitting in a dish, so tight framing does not imply raw whole produce. The
+# three-stage filter described in this comment's previous version -- label
+# filter, ImageNet visual filter, hand review -- demonstrably did not catch it.
 #
-#   Wikimedia Commons -- used for the three crops Open Images covers poorly.
+# Two attempts to filter it here by composition were abandoned. Scoring
+# background uniformity, brightness and how centred the edge energy was kept 35
+# of 670 apples but 1 of 516 tomatoes, because tomato photographs favour wooden
+# tables and blue bowls while apple photographs favour white studio sweeps -- the
+# score measured photographic convention, not suitability. The decisive
+# measurement was running that score over the six real rig photos in my images/:
+# the "single centred subject" term came out at 0.00 on all six. Filtering
+# semantics with a structural heuristic does not work, and there is no cheap
+# classifier to check against, because ImageNet-1k has no onion, potato, ginger
+# or tomato class.
 #
-# Three filters were applied, in order:
-#   1. Label filter. Any photo carrying a prepared-food or drink label was
-#      dropped (747 images: Juice 151, Cocktail 132, Cheese 116, Drink 101,
-#      Pizza 53, Bread 46, Salad 43, French fries 31, ...).
-#   2. Visual filter. Open Images' human labels are sparse -- a plate of roast
-#      potatoes may carry only "Potato" -- so a full ImageNet classifier
-#      rejected another 99 whose top prediction was a cooked dish, a drink or
-#      a non-food object. Container classes (crate, basket, tray) were
-#      deliberately NOT blocked: a crate of apples is exactly the multiple-item
-#      case the camera will see.
-#   3. Hand review. The Commons images were reviewed by eye and picked
-#      individually, because searching "ginger" also returns ginger plants,
-#      gingerbread, ginger ale and a person named Ginger. Yield was low:
-#      28 of 135 for ginger, 31 of 153 for onion, 40 of 145 for corn.
+# What they were worth is recorded under EXTRA_TRAIN_MAX_PER_CROP below: 1.6
+# points on the Kaggle test split. The large gain, 32.8% -> 65.5%, was on
+# held-out Open Images photographs, which is not a distribution this rig will
+# ever produce.
 #
-# Open Images' own "ginger" label included a photograph of carrots. It was
-# caught in hand review and dropped.
+# To put them back: restore the line below and run
+# `python scripts/curate_dataset.py --restore`.
+# Rig-domain composites: produce photographed against the real box interior,
+# generated by scripts/make_rig_composites.py. Every class gets them, including
+# `unknown`, and that universality is the entire point.
 #
-# Ginger remains the weak class: 28 usable extra images against 300-670 for the
-# others, because neither source has much whole raw ginger. It is the one crop
-# where your own ESP32-CAM captures would make a decisive difference.
-EXTRA_TRAIN_DIRS = {c: DATA_RAW / "extra" / c for c in TARGET_CROPS}
+# Before these existed, images taken inside the box appeared in exactly ONE
+# class -- `unknown`, via the empty-box crops in BACKGROUND_DIR -- while the 8
+# crop classes held only Kaggle web photos. The cheapest rule separating those
+# classes is "thermocol texture -> unknown", and that is what the model learned.
+# Measured on the real rig photos:
+#
+#     lemon in the box     -> unknown 90.2%    (same lemon as a web photo: lemon 99.6%)
+#     tomato in the box    -> unknown 79.7%    (same tomato as a web photo: TOMATO)
+#     pomegranate in box   -> potato  79.3%    accepted, and wrong
+#
+# The answer is not to drop the empty-box images -- recognising an empty box is
+# a real requirement. It is to make background useless as a cue by giving every
+# class the same background, which forces the model onto the object itself.
+EXTRA_TRAIN_DIRS = {}  # scripts/build_rig_dataset.py writes data/prepared directly
 
-# The 24 unknown-source classes together hold ~24x more images than any single
-# crop. Left alone that imbalance would teach the model to answer "unknown" for
-# everything. We cap the unknown class at this multiple of the average crop
-# class size, sampling evenly across the source classes.
+# EXTRA_TRAIN_DIRS = {c: DATA_RAW / "extra" / c for c in TARGET_CROPS}
+
+# Cap on the produce-negative half of the unknown class, as a multiple of the
+# average crop class size. The 27 source classes together hold far more images
+# than any single crop; left alone that imbalance would teach the model to answer
+# "unknown" for everything. prepare_data.py samples evenly across the source
+# classes up to this budget.
+#
+# The background images are added ON TOP of this budget, not inside it, so the
+# unknown class ends up at roughly (1.0 x average crop) + however many
+# backgrounds exist. Keep scripts/make_background.py --count modest for that
+# reason; 60 keeps the train-set imbalance near the 1.76x at which the
+# class-weighting and label-smoothing experiments below were measured.
 UNKNOWN_SIZE_MULTIPLIER = 1.0
 
 
 def class_names():
     """The model's output classes, in the fixed order used everywhere.
 
-    This order defines the integer crop_id sent over ESP-NOW, so it must stay
-    stable. Alphabetical crops first, then unknown last -- appending unknown at
-    the end means adding it later would not renumber the existing crops.
+    Plain alphabetical, including `empty`. The order defines the crop_id byte
+    sent over ESP-NOW, so it must stay stable -- and it must also match the
+    order Keras assigns when it reads the folders, which is alphabetical. The
+    two used to disagree, with `unknown` appended last; sorting everything
+    together removes that trap.
     """
-    names = sorted(TARGET_CROPS.keys())
+    names = list(TARGET_CROPS)
     if INCLUDE_UNKNOWN:
         names.append(UNKNOWN_CLASS)
-    return names
+    return sorted(names)
 
 
 NUM_CLASSES = len(class_names())
@@ -241,19 +297,49 @@ SPLIT_RATIOS = (0.70, 0.15, 0.15)
 # --------------------------------------------------------------------------
 # Augmentation
 #
-# Deliberately mild. The ESP32-CAM will be fixed above the tray, so the model
-# does not need to survive large rotations -- but it does need to survive bad
-# white balance and a dim storage unit, hence the brightness/contrast range.
+# Geometry stays mild: the camera is fixed above the tray, so the model does not
+# need to survive large rotations.
+#
+# Photometrics are not mild, and that is the point. With the off-target produce
+# removed, the remaining gap between the training data and the device is not
+# "which vegetable" -- it is that the training images are sharp, well-exposed web
+# photographs and the device returns soft, warm, washed-out OV2640 frames. Look
+# at my images/from ESPCAM/ next to any Kaggle photo; that gap is now the main
+# source of error, and augmentation is the only lever available for it without
+# capturing real frames per crop.
 # --------------------------------------------------------------------------
 
 AUG_ROTATION = 0.08         # fraction of 2*pi
 AUG_ZOOM = 0.15
 AUG_TRANSLATION = 0.10
-AUG_BRIGHTNESS = 0.25
-AUG_CONTRAST = 0.25
+AUG_BRIGHTNESS = 0.20
+AUG_CONTRAST = 0.20
 AUG_HORIZONTAL_FLIP = True
 
-# Colour jitter: OFF, and it must stay off. Measured on the test set:
+# Defocus. The OV2640 behind a cheap fixed lens is never quite sharp, and at
+# 96x96 a soft edge and a sharp one are genuinely different inputs. sigma is
+# sampled up to this value.
+#
+# This also removes a shortcut the model would otherwise take. The unknown class
+# is generated from a real photograph and carries real blur and JPEG artefacts,
+# while the crop classes are clean web photos. Blurring every class during
+# training stops sharpness itself from being the feature that separates
+# "crop" from "empty".
+AUG_BLUR_SIGMA = 0.5
+
+# White balance, as a per-channel gain: red up and blue down for a warm cast,
+# the reverse for a cool one. The value is the maximum shift in either
+# direction, so 0.12 spans roughly the range between the warm ESPCAM frames in
+# my images/ and a cooler LED lamp.
+#
+# This is deliberately NOT RandomHue. A hue rotation moves red towards green and
+# destroys the colour identity the thin classes depend on, which is what the
+# measurement below found. A white-balance gain shifts the white point while
+# leaving the ordering of object colours intact -- a warm-cast tomato is still
+# the reddest thing in the frame.
+AUG_WHITE_BALANCE = 0.06
+
+# Hue and saturation jitter: OFF, and it must stay off. Measured on the test set:
 #
 #     hue=0    sat=0      88.2%   <- current
 #     hue=0.03 sat=0.10   73.1%   (onion 0.30, unknown 0.43)
@@ -264,11 +350,21 @@ AUG_HORIZONTAL_FLIP = True
 # for the class set as a whole. Onion, potato and ginger are separated mainly
 # BY their brown/tan colour, so perturbing hue destroys the main signal. It
 # does lift apple (0.70 -> 0.90) while costing far more elsewhere.
+#
+# Those numbers were measured when `unknown` was 27 other vegetables, so the
+# unknown figure no longer transfers. The reason the crop classes suffered does:
+# onion, potato and ginger are still in the set and still separated by colour.
+# AUG_WHITE_BALANCE above is the intended way to handle a colour cast.
 AUG_HUE = 0.0
 AUG_SATURATION = 0.0
 
 # Class weighting: OFF. Measured 84.9% with it against 88.2% without, on a
 # 1.76x imbalance that is evidently mild enough not to need correcting.
+#
+# The imbalance is smaller now, not larger: the crop classes are the Kaggle
+# folders alone at 68-94 training images each, and the unknown class is sized to
+# match by scripts/make_background.py --count. So the case for leaving this off
+# is stronger than when it was measured.
 USE_CLASS_WEIGHTS = False
 
 # Label smoothing: OFF, tested together with class weighting above.
@@ -304,21 +400,11 @@ CONFIDENCE_THRESHOLD = 0.60
 
 MAX_MODEL_BYTES = 1200 * 1024
 
-# Cap on how many extra images a single crop may absorb from EXTRA_TRAIN_DIRS.
+# Cap on how many extra images a single class may absorb from EXTRA_TRAIN_DIRS.
 #
-# Measured with the 8 crop classes' val/test held identical throughout.
-# "held-out" is Open Images photos never trained on, grouped by SOURCE
-# photograph so no framing of a training image can leak into it.
+# 150 lets each crop take all ~110 of its composites while holding `unknown` to
+# 150 of its 324. Unknown already carries the produce negatives and the
+# empty-box crops, so without the cap it would outweigh every crop class.
 #
-#     training data                    Kaggle test   held-out   real photos
-#     Kaggle only                          88.2%       32.8%       6/9
-#     + Open Images, unfiltered            90.9%       65.5%       7/9
-#     + Open Images, raw produce only      89.8%       65.0%       7/9
-#
-# The last row is what ships. Filtering out prepared food cost essentially
-# nothing on the held-out set once the thin classes were topped up from
-# Commons, and it removes an entire class of confusion the deployment would
-# otherwise inherit.
-#
-# 100 keeps the imbalance at 2.02x, with ginger the smallest class.
-EXTRA_TRAIN_MAX_PER_CROP = 100
+# Resulting train split: ~178-204 per crop, 272 unknown, 1.53x imbalance.
+EXTRA_TRAIN_MAX_PER_CROP = 150

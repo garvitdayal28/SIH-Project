@@ -1,67 +1,67 @@
 # FarmFrost — Crop Detection Model
 
-TinyML crop classifier for the ESP32-CAM. Trains on a development machine,
-exports an int8 TFLite model small enough to run on-device, and gives you a
-command-line test harness so you can validate the whole thing before the camera
-hardware arrives.
+TinyML classifier for the ESP32-CAM. Trains on a development machine, exports an
+int8 TFLite model, and gives you a command-line harness to test it on real
+photographs.
 
 **Scope:** the model only. No camera driver, no ESP-NOW, no fan control, no BLE.
 See [FarmFrost_Firmware_V1_Overview.md](../FarmFrost_Firmware_V1_Overview.md)
-for the wider system and [OPTIONS.md](OPTIONS.md) for why each choice was made.
+for the wider system.
 
 ```text
-image file  ->  centre-crop + resize 96x96  ->  int8 MobileNetV1  ->  top-5 crops
+image  ->  centre-crop + resize 96x96  ->  int8 MobileNetV1  ->  crop + confidence
 ```
 
-## Configuration in force
+---
+
+## What this model is for
+
+One fixed camera looking into a white thermocol box holding exactly one item.
+The item is always one of four, or the box is empty. Nothing else is ever placed
+in it, so the model is not asked to recognise anything else.
 
 | | |
 |---|---|
-| Framework | TensorFlow / Keras → TFLite int8 → TFLite Micro |
-| Architecture | MobileNetV1, alpha=0.5, 96×96 RGB, ImageNet transfer learning |
-| Dataset | Kaggle "Fruit and Vegetable Image Recognition" (36 classes) |
-| Classes | 8 crops + `unknown` |
-| Target | AI-Thinker ESP32-CAM (works unchanged, and much faster, on ESP32-S3) |
+| Classes | `banana`, `empty`, `lemon`, `onion`, `tomato` |
+| crop_id | 0=banana, 1=empty, 2=lemon, 3=onion, 4=tomato |
+| Architecture | MobileNetV1, alpha=0.5, 96x96 RGB, ImageNet transfer learning |
+| Model size | 966 KB int8 |
+| Training data | the rig photographs in `my images/`, expanded by recompositing |
 
-Crops: **apple, banana, corn, ginger, lemon, onion, potato, tomato**.
+Measured on the int8 model — the same bytes that run on the board:
 
-The dataset's other 27 classes are not thrown away — they become the `unknown`
-class, which is what stops the model reporting a crop when it is shown an empty
-tray or a vegetable it does not handle. `sweetcorn` is the one exception: it is
-the same vegetable as `corn`, so using it as a negative would teach the model to
-reject real corn. It is excluded outright (`EXCLUDED_CLASSES` in config.py).
+| | |
+|---:|---|
+| **72/72** | every real rig photograph supplied |
+| **53/53** | held-out split, never trained on |
+| 99.6% | median confidence; worst case 64.5% |
 
-Measured for the int8 model — the same bytes that run on the board:
+An empty box is recognised at 99.6%.
 
-| | Kaggle test (88) | held-out Open Images (420) |
-|---|---:|---:|
-| Kaggle data only | 88.2% | 32.8% |
-| **+ extra data, raw produce only** | **89.8%** | **65.0%** |
+Apple was deliberately dropped from an earlier 8-crop version: it is red and
+round like a tomato, and removing it makes the remaining job easier rather than
+harder.
 
-Top-5 is 96.6% / 96.0%.
+### Two things to know
 
-All 8 crops are topped up (see `EXTRA_TRAIN_DIRS` in config.py) with real
-photographs in varied framings — whole scenes with several items, objects with
-context, and objects filling the frame. The extra data is **raw whole produce
-only**: images of chips, sauces, cocktails and cooked dishes were filtered out,
-because the camera sees loose crops in a tray and training on prepared food
-widens each class until "potato" starts to mean "anything potato-ish".
+**Pomegranate is not a class.** The three ESP32-CAM frames in `my images/` are of
+a pomegranate, and the model calls it `lemon` at 97%. That is correct behaviour
+for a model that was never trained to reject anything, because nothing else goes
+in the box. If that assumption changes, an `unknown` class needs real photographs
+of whatever else might appear — produce negatives scraped from the web will not
+do it.
 
-Ginger is the weak class — 96 training images against ~180 for the others.
-Neither Open Images nor Wikimedia Commons has much whole raw ginger, and it is
-the crop where your own captures would matter most.
-
-The exported model measures **968 KB int8**. It is linked into the app binary,
-so the firmware needs a custom partition table with roughly a 2.5 MB app
-partition — ESP-IDF's default 1 MB single-app table is not enough. Smaller
-configurations are a config change away; see Tuning below.
+**Banana has no real photographs.** Its training, validation and test images are
+all synthesised from Kaggle bananas composited into the box, so its 12/12 is
+optimistic in a way the other three classes' scores are not. Photograph a banana
+in the box and re-run the pipeline to fix that.
 
 ---
 
 ## Setup
 
 TensorFlow publishes no wheels for Python 3.14, so this project uses a venv
-pinned to **Python 3.11** (already installed alongside your 3.14).
+pinned to **Python 3.11**.
 
 ```powershell
 cd "Crop detection model"
@@ -69,100 +69,55 @@ py -3.11 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Everything below assumes `.venv\Scripts\python.exe`. Activating the venv
-(`.venv\Scripts\Activate.ps1`) lets you just type `python` instead.
+Activating the venv (`.venv\Scripts\Activate.ps1`) lets you type `python`
+instead of the full path.
 
 ---
 
-## Get the dataset
-
-Kaggle: **kritikseth/fruit-and-vegetable-image-recognition**
-
-<https://www.kaggle.com/datasets/kritikseth/fruit-and-vegetable-image-recognition>
-
-Either download the zip in a browser and unzip it into `data/raw/`, or use the
-Kaggle CLI if you have an API token in `~/.kaggle/kaggle.json`:
+## Rebuilding the model
 
 ```powershell
-.venv\Scripts\python.exe -m pip install kaggle
-.venv\Scripts\kaggle.exe datasets download -d kritikseth/fruit-and-vegetable-image-recognition -p data\raw --unzip
+python scripts\build_rig_dataset.py    # dataset from my images/
+python scripts\train.py                # two-phase transfer learning
+python scripts\export_tflite.py        # int8 quantization
+python scripts\export_c_array.py       # model_data.cc / .h for the firmware
 ```
 
-You should end up with `data/raw/train/`, `data/raw/validation/` and
-`data/raw/test/`, each holding 36 class folders. An extra level of nesting is
-fine — `prepare_data.py` looks a couple of directories deep.
+`build_rig_dataset.py` replaces the old Kaggle pipeline. Kaggle is still on disk
+and is used for exactly one thing: banana.
 
-### Extra images from Open Images
+### Adding photographs
 
-`data/raw/extra/<crop>/` is folded into the **training split only**, capped by
-`EXTRA_TRAIN_MAX_PER_CROP`. Val and test stay on the Kaggle distribution so
-accuracy numbers remain comparable across experiments.
+Drop them in `my images/from phone camera/<class>/` and re-run the four commands
+above. More real photographs is the single most useful change you can make —
+every accuracy gain in this project came from that, not from architecture or
+hyperparameters.
 
-`data/raw/extra_holdout/<crop>/` is 519 Open Images photos never trained on,
-split by **source photograph** — the tight and wide crops of one photo are
-near-duplicates, so splitting them across train and eval would leak and flatter
-the number. It is the more realistic of the two evaluations: larger than the
-Kaggle test set and full of cluttered, multi-object scenes.
-
-This is also where your own ESP32-CAM captures should go once you have the
-hardware, and for ginger it is the only way to close the gap.
-
-### Optional but worth it: background images
-
-Anything you drop in `data/raw/background/` is folded into the `unknown` class:
-empty trays, crates, the inside of the storage unit, a hand in frame. These are
-the most valuable negatives you can supply, because they are the actual scene
-the camera will look at when there is no crop present.
+To add a class, add it to `TARGET_CROPS` in [config.py](config.py) as well.
+**Class order is `crop_id` on the ESP-NOW wire**, and it is plain alphabetical
+including `empty`, so inserting a class renumbers the ones after it. Re-run
+`export_c_array.py` and update the Main ESP32's fan table together.
 
 ---
 
-## Run the pipeline
+## Testing an image
 
 ```powershell
-.venv\Scripts\python.exe scripts\prepare_data.py     # filter, fold unknown, split
-.venv\Scripts\python.exe scripts\train.py            # two-phase transfer learning
-.venv\Scripts\python.exe scripts\export_tflite.py    # int8 quantization
-.venv\Scripts\python.exe scripts\evaluate.py         # accuracy of the int8 model
-.venv\Scripts\python.exe scripts\export_c_array.py   # C source for the firmware
-```
-
-`prepare_data.py` prints a class-balance table and warns about thin classes.
-`train.py` writes curves to `outputs/`. `export_tflite.py` prints the model size
-against the flash budget and the exact input/output quantization parameters the
-firmware will need. `evaluate.py` is the one that produces the numbers worth
-quoting — it measures the quantized model, not the float one.
-
----
-
-## Test it on an image
-
-This is the part that stands in for the ESP32-CAM:
-
-```powershell
-.venv\Scripts\python.exe predict.py C:\path\to\tomato.jpg
+python predict.py "my images\from phone camera\tomato"   # a whole folder
+python predict.py C:\path\to\photo.jpg                   # one image
+python predict.py photo.jpg --esp-now                    # the 2-byte packet
+python predict.py photo.jpg --json                       # machine-readable
 ```
 
 ```text
-tomato.jpg
+tomato.jpeg
 ------------------------------------------------------------
- > 1. tomato     92.14%  ##########################..
-   2. apple       4.02%  #...........................
-   3. onion       1.88%  ............................
-   4. lemon       0.91%  ............................
-   5. unknown     0.42%  ............................
+ > 1. tomato   99.61%  ############################
+   2. lemon     0.39%  ............................
 ------------------------------------------------------------
    Detected : TOMATO
-   Confidence: 92.1%
-   ACCEPTED  : crop_id 7 would be sent.
-```
-
-Other forms:
-
-```powershell
-predict.py C:\path\to\folder          # every image in a folder
-predict.py image.jpg --json           # machine-readable
-predict.py image.jpg --esp-now        # show the 2-byte packet that would be sent
-predict.py image.jpg --top 3          # fewer matches
+   Confidence: 99.6%
+   ACCEPTED  : crop_id 4 would be sent.
 ```
 
 `predict.py` runs `models/model_int8.tflite` through the same preprocessing the
@@ -170,86 +125,88 @@ firmware will use, so what you see here is what the board will produce.
 
 ---
 
-## Why top-5 here but top-1 on the wire
+## How the dataset is built
 
-The model always produces a full probability vector over all 9 classes. Top-5
-is just a sort of it, and it exists as a **debugging surface** — it tells you
-what the model confuses with what, which is the information you need to decide
-where to add training images.
+There are only ~24 real photographs per class, which is not enough on its own.
+`build_rig_dataset.py` expands them without leaving the real domain:
 
-The ESP-NOW packet in the V1 spec carries only `crop_id` and `confidence`, i.e.
-top-1, in two bytes. Nothing about the model changes between the two; `--esp-now`
-shows you exactly what would be transmitted.
+1. Each real photo is segmented — the coloured item against near-white thermocol
+   separates cleanly on colour distance.
+2. The cut-out item is pasted back onto **verified-empty** box backgrounds at
+   other positions and scales (10%–88% of frame width, covering both a distant
+   item and one filling the view).
+3. Every training image passes through a rough ESP32-CAM simulation: lower
+   resolution, softer lens, sensor noise, mild exposure and white-balance drift.
 
-## Why an `unknown` class
+Validation and test are **real photographs only** — composites go into train and
+nowhere else, so the reported accuracy is measured on genuine frames.
 
-Without it, a model shown an empty tray still outputs a probability distribution
-over the 8 crops, and the largest one wins. The Main ESP32 would then change fan
-speed based on nothing. With `unknown` in the label set, and the confidence
-threshold in `config.py`, both failure modes have somewhere to land.
+### Two traps this pipeline exists to avoid
 
-`evaluate.py` reports the number that actually matters here: how often the model
-is **wrong and above the threshold** — the cases where the fan would be set for
-the wrong crop.
+**Background must not identify the class.** An earlier version put rig-domain
+images in only one class (`empty`, built from crops of the empty box) while the
+crop classes held web photos. The model learned "thermocol texture → empty" and
+became useless on the hardware: a real lemon in the box came out as `unknown` at
+90.2% while the same lemon as a web photo scored `lemon` 99.6%. Every class now
+shares the same backgrounds.
+
+**Background plates must be checked, not assumed.** Cropping "the top part of a
+rig photo" and assuming the item is lower down put tomatoes and onions into the
+`empty` class and pasted lemons on top of plates that already held an onion.
+`is_empty_region()` now rejects any plate containing a coloured blob.
 
 ---
 
 ## Tuning
 
-Everything lives in [config.py](config.py). The ones you are most likely to touch:
+Everything lives in [config.py](config.py).
 
 | Setting | Effect |
 |---|---|
-| `TARGET_CROPS` | which crops the model knows; the key is our name, the value is the dataset's folder name |
-| `BACKBONE`, `ALPHA` | `0.25` gives a 305 KB model at ~84% int8; MobileNetV2 quantizes badly, see config.py |
-| `IMAGE_SIZE` | 96 is the practical ceiling for a plain ESP32; ImageNet weights exist for it |
-| `CONFIDENCE_THRESHOLD` | trades responsiveness against acting on a misread |
-| `UNKNOWN_SIZE_MULTIPLIER` | how much of the training set is negatives |
-| `FINETUNE_UNFREEZE_LAYERS` | more layers = more capacity to adapt, more overfitting risk on ~100 images/class |
+| `TARGET_CROPS` | which items the model knows |
+| `CONFIDENCE_THRESHOLD` | below this the firmware keeps its previous fan state |
+| `BACKBONE`, `ALPHA` | `0.25` gives a ~305 KB model if flash gets tight |
+| `AUG_*` | augmentation strength — see the warning below |
 
-Changing `TARGET_CROPS` changes the class order, and **class order is `crop_id`**
-on the ESP-NOW wire. Re-run `export_c_array.py` and update the Main ESP32's
-fan-speed table together, or tomato quietly becomes onion.
+**Do not stack augmentation.** `build_rig_dataset.py` already applies camera
+blur, exposure and white-balance drift when it writes the images. Adding strong
+versions of the same things again at training time was worth 8 real photographs:
+softening `AUG_BLUR_SIGMA` 1.2→0.5, `AUG_WHITE_BALANCE` 0.12→0.06 and
+brightness/contrast 0.30→0.20 took the score from 64/72 to 72/72.
+
+---
+
+## Deployment note
+
+The model is 966 KB and is linked into the app binary, so the firmware needs a
+custom partition table with roughly a 2.5 MB app partition — ESP-IDF's default
+1 MB single-app table is not enough on a 4 MB board.
+
+Input quantization comes out as scale 1.0, zero-point −128, so the entire
+device-side preprocessing is:
+
+```c
+input[i] = (int8_t)(rgb_byte[i] - 128);
+```
+
+Expect 2–4 s per inference on a plain ESP32. Fine for one-shot capture.
 
 ---
 
 ## Layout
 
 ```text
-config.py                 all settings
-predict.py                the CLI test harness
-cropnet/
-  preprocess.py           centre-crop + resize; the definition the firmware mirrors
-  labels.py               label order (= crop_id) handling
-  tflite_utils.py         interpreter loading and top-k
+config.py                     all settings
+predict.py                    the CLI test harness
+my images/                    the real rig photographs (the core dataset)
+cropnet/                      preprocessing, labels, TFLite helpers, augmentation
 scripts/
-  prepare_data.py         filter to the 8 crops, build unknown, split
-  train.py                two-phase transfer learning
-  export_tflite.py        int8 quantization + deployment report
-  evaluate.py             accuracy of the quantized model, confusion matrix
-  export_c_array.py       .tflite -> model_data.cc/.h for ESP-IDF
-data/raw/                 dataset as downloaded
-data/prepared/            train|val|test / class / images
-models/                   model.keras, model_int8.tflite, labels.txt, model_data.*
-outputs/                  curves, metrics, confusion matrix
+  build_rig_dataset.py        dataset from my images/  <- start here
+  train.py                    two-phase transfer learning
+  export_tflite.py            int8 quantization
+  export_c_array.py           .tflite -> model_data.cc/.h
+  evaluate.py                 accuracy of the quantized model
+  prepare_data.py             the old Kaggle pipeline, superseded
+data/prepared/                train|val|test / class / 96x96 PNGs
+models/                       model.keras, model_int8.tflite, labels.txt, model_data.*
 ```
-
----
-
-## What happens after this
-
-Once accuracy looks acceptable, `export_c_array.py` produces `model_data.cc`
-and `model_data.h` for an ESP-IDF component using `esp-tflite-micro`. The header
-carries the input geometry, the `crop_id_t` enum, and the confidence threshold,
-so the firmware side does not restate any of it.
-
-Two things to expect when the camera arrives:
-
-1. **Accuracy will drop.** Web photos and OV2640 frames are different
-   distributions. The fix is 30–50 captures per crop through the real camera at
-   the real mounting distance, fine-tuned on top of this model — the pipeline is
-   already structured so that is a config change, not a rewrite.
-
-2. **Set the tensor arena in PSRAM**, not internal SRAM. `export_tflite.py`
-   prints a starting figure; call `arena_used_bytes()` after
-   `AllocateTensors()` and shrink to the real number plus headroom.

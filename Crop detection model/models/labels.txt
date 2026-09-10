@@ -1,9 +1,5 @@
-apple
 banana
-corn
-ginger
+empty
 lemon
 onion
-potato
 tomato
-unknown

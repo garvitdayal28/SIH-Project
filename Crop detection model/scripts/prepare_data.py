@@ -4,22 +4,27 @@ Turn the downloaded Kaggle dataset into a training-ready folder tree.
     python scripts/prepare_data.py
 
 Reads:  data/raw/       the dataset exactly as unzipped
-Writes: data/prepared/  train|val|test / <class> / *.jpg
+Writes: data/prepared/  train|val|test / <class> / *.png
 
 Three things happen here that matter more than they look:
 
-1. Only the 12 crops in config.TARGET_CROPS are kept. The dataset has 36
-   classes; carrying the other 24 as their own outputs would widen the final
-   layer, need more data per class, and lower accuracy on the crops we actually
-   care about.
+1. Only the 8 crops in config.TARGET_CROPS are kept. The Kaggle set ships 36
+   classes; carrying the rest as their own outputs would widen the final layer,
+   need more data per class, and lower accuracy on the crops we actually care
+   about.
 
-2. The other 24 classes are folded into a single "unknown" class instead of
-   being thrown away. They are the most useful negatives we have -- real produce
-   photos that are not one of our crops -- and they are free.
+2. The unknown class is built from data/raw/background/ -- photographs of the
+   empty box. It means "no crop present", which is the only non-crop state this
+   rig can be in.
 
-3. The unknown class is capped and evenly sampled. 24 source classes against 12
-   single crops is a 24:1 imbalance; left alone the model learns that answering
-   "unknown" is right most of the time.
+   It used to be built from the 27 non-target produce classes, as negatives
+   meaning "some other vegetable". Those classes have been removed; see
+   scripts/curate_dataset.py for why, and config.UNKNOWN_SOURCE_CLASSES for how
+   to put them back. The code path for them is still here and still works -- set
+   that list and the round-robin sampling below runs again.
+
+3. Every image is resized here, once, through the same Pillow code path
+   predict.py uses. See write_plan() for why that matters more than it sounds.
 """
 
 from __future__ import annotations
@@ -296,7 +301,19 @@ def report_unused_classes(by_split) -> None:
 
 
 def add_unknown_class(plan, by_split, had_splits, rng: random.Random) -> None:
-    """Build the unknown class, sampled evenly and capped against imbalance."""
+    """Build the unknown class from produce negatives and/or background photos.
+
+    Two independent sources, either of which may be empty:
+
+      config.UNKNOWN_SOURCE_CLASSES  other produce, sampled round-robin and
+                                     capped -- currently empty by design
+      config.BACKGROUND_DIR          photographs of the empty box, split
+                                     70/15/15 -- currently the only source
+
+    The two are not equivalent and mean different things to the firmware. The
+    first teaches "this is a vegetable I do not handle"; the second teaches
+    "there is nothing here". This rig only ever needs the second.
+    """
     for split in SPLIT_NAMES:
         crop_counts = [len(plan[split][c]) for c in config.TARGET_CROPS]
         if not crop_counts or sum(crop_counts) == 0:
@@ -343,6 +360,23 @@ def add_unknown_class(plan, by_split, had_splits, rng: random.Random) -> None:
         plan["val"][config.UNKNOWN_CLASS].extend(val_bg)
         plan["test"][config.UNKNOWN_CLASS].extend(test_bg)
         print(f"Folded in {len(backgrounds)} background images from {config.BACKGROUND_DIR}")
+
+    # Fail here rather than three scripts later. An unknown class with no images
+    # produces an empty folder in data/prepared/, which makes Keras disagree with
+    # config.class_names() and turns into a confusing class-order error in
+    # train.py -- a long way from the actual cause.
+    if not any(plan[split][config.UNKNOWN_CLASS] for split in SPLIT_NAMES):
+        raise SystemExit(
+            "INCLUDE_UNKNOWN is True but the unknown class has no images.\n\n"
+            "Both of its sources are empty:\n"
+            f"  config.UNKNOWN_SOURCE_CLASSES  {len(config.UNKNOWN_SOURCE_CLASSES)} classes\n"
+            f"  {config.BACKGROUND_DIR}  no images\n\n"
+            "Generate the empty-box images the unknown class is meant to be:\n"
+            "    python scripts/make_background.py\n\n"
+            "Or set INCLUDE_UNKNOWN = False in config.py to train the 8 crops\n"
+            "alone -- but then the model will always name a crop, even for an\n"
+            "empty tray, and the firmware has nothing to reject on."
+        )
 
 
 def write_plan(plan) -> None:

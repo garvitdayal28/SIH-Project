@@ -57,7 +57,7 @@
 namespace {
 
 constexpr int kInputSize = CROP_MODEL_INPUT_WIDTH;   // 96, square
-constexpr int kNumClasses = CROP_MODEL_NUM_CLASSES;  // 9
+constexpr int kNumClasses = CROP_MODEL_NUM_CLASSES;  // 5
 
 const tflite::Model     *g_model       = nullptr;
 tflite::MicroInterpreter *g_interpreter = nullptr;

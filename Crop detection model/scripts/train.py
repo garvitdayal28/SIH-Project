@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
+from cropnet.augment import RandomWhiteBalance
 from cropnet.labels import write_labels
 
 
@@ -106,19 +107,57 @@ def build_datasets(tf):
 
 
 def build_augmentation(tf):
+    """Assemble the training-only augmentation block.
+
+    Ordered to mirror a real imaging chain: geometry first, then the lens
+    (defocus), then the sensor and its white balance. The block is named
+    "augmentation" because export_tflite.py strips it by that name, so nothing
+    here costs flash or inference time on the device.
+
+    Everything operates on raw 0-255 pixels -- the model's Rescaling layer runs
+    after this block, not before.
+    """
     layers = [
         tf.keras.layers.RandomRotation(config.AUG_ROTATION),
         tf.keras.layers.RandomZoom(config.AUG_ZOOM),
         tf.keras.layers.RandomTranslation(config.AUG_TRANSLATION, config.AUG_TRANSLATION),
-        tf.keras.layers.RandomBrightness(config.AUG_BRIGHTNESS, value_range=(0, 255)),
-        tf.keras.layers.RandomContrast(config.AUG_CONTRAST),
     ]
     if config.AUG_HORIZONTAL_FLIP:
         layers.insert(0, tf.keras.layers.RandomFlip("horizontal"))
 
-    # Colour jitter goes last so it acts on the final geometry. Both layers
-    # expect a 0-255 value range, matching the raw pixels at this point in the
-    # graph -- Rescaling has not run yet.
+    # Defocus, applied after geometry so it blurs the final framing rather than
+    # something that is about to be resampled again.
+    #
+    # This also closes a shortcut. The unknown class is generated from a real
+    # photograph and carries genuine blur and JPEG artefacts, while the crop
+    # classes are clean web photos; without blurring every class, sharpness
+    # itself would separate "crop" from "empty" and the model would score well
+    # for a reason that does not exist on the device.
+    blur_sigma = getattr(config, "AUG_BLUR_SIGMA", 0)
+    if blur_sigma:
+        layers.append(
+            tf.keras.layers.RandomGaussianBlur(
+                factor=1.0, kernel_size=3, sigma=(0.0, blur_sigma)
+            )
+        )
+
+    layers.extend([
+        tf.keras.layers.RandomBrightness(config.AUG_BRIGHTNESS, value_range=(0, 255)),
+        tf.keras.layers.RandomContrast(config.AUG_CONTRAST),
+    ])
+
+    # White balance last, so it acts on the final pixels the way a camera's AWB
+    # would. See cropnet/augment.py for why this is not RandomHue.
+    white_balance = getattr(config, "AUG_WHITE_BALANCE", 0)
+    if white_balance:
+        layers.append(
+            RandomWhiteBalance(
+                factor=white_balance, value_range=(0, 255), seed=config.SEED
+            )
+        )
+
+    # Hue and saturation jitter stay available but measure badly; see AUG_HUE in
+    # config.py before switching them on.
     if getattr(config, "AUG_HUE", 0):
         layers.append(tf.keras.layers.RandomHue(config.AUG_HUE, value_range=(0, 255)))
     if getattr(config, "AUG_SATURATION", 0):

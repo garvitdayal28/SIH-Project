@@ -19,7 +19,7 @@ extern const size_t g_crop_model_data_len;
 #define CROP_MODEL_INPUT_WIDTH    96
 #define CROP_MODEL_INPUT_HEIGHT   96
 #define CROP_MODEL_INPUT_CHANNELS 3
-#define CROP_MODEL_NUM_CLASSES    9
+#define CROP_MODEL_NUM_CLASSES    5
 
 // Confidence below this means the Main ESP32 should keep its previous fan
 // state rather than act on the detection.
@@ -29,16 +29,12 @@ extern const size_t g_crop_model_data_len;
 // table is indexed by them, so they must never be reordered without changing
 // that table to match.
 typedef enum {
-    CROP_APPLE            = 0,
-    CROP_BANANA           = 1,
-    CROP_CORN             = 2,
-    CROP_GINGER           = 3,
-    CROP_LEMON            = 4,
-    CROP_ONION            = 5,
-    CROP_POTATO           = 6,
-    CROP_TOMATO           = 7,
-    CROP_UNKNOWN          = 8,
-    CROP_COUNT               = 9
+    CROP_BANANA           = 0,
+    CROP_EMPTY            = 1,
+    CROP_LEMON            = 2,
+    CROP_ONION            = 3,
+    CROP_TOMATO           = 4,
+    CROP_COUNT               = 5
 } crop_id_t;
 
 extern const char *const g_crop_labels[CROP_MODEL_NUM_CLASSES];

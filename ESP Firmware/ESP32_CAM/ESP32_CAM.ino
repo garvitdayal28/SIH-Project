@@ -122,7 +122,7 @@ static uint8_t MAIN_ESP_MAC[6] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
 //
 // Comes from model_data.h, which export_c_array.py generates from the same
 // labels.txt the model was trained against -- CROP_NAMES, CROP_COUNT and
-// CROP_UNKNOWN below are all defined there.
+// CROP_EMPTY below are all defined there.
 //
 // This used to be a hand-written list. It is generated now because it cannot
 // be allowed to drift: the index IS the crop_id on the wire, so a table that
@@ -184,7 +184,7 @@ static uint8_t *g_jpeg       = nullptr;   // copy of the classified frame
 static size_t   g_jpegLen    = 0;
 static uint16_t g_jpegW      = 0;         // its dimensions, needed to decode it
 static uint16_t g_jpegH      = 0;
-static uint8_t  g_cropId     = CROP_UNKNOWN;
+static uint8_t  g_cropId     = CROP_EMPTY;
 static uint8_t  g_confidence = 0;
 static uint32_t g_seq        = 0;
 static uint32_t g_lastDetectMs = 0;
@@ -590,7 +590,12 @@ void loop() {
                 (unsigned long)cropModelLastInferMs(), mr, mg, mb);
 
 #if ENABLE_ESPNOW
-  if (g_confidence >= CONFIDENCE_THRESHOLD) {
+  if (g_cropId == CROP_EMPTY) {
+    // An empty box is a confident, correct answer with nothing to act on. The
+    // fan should hold whatever it was doing for the last real crop rather than
+    // be driven by a reading that names no crop at all.
+    Serial.println("[CAM] Box is empty, nothing to send");
+  } else if (g_confidence >= CONFIDENCE_THRESHOLD) {
     sendResult();
   } else {
     // Sending it anyway would be fine -- the main board checks the threshold
